@@ -14,6 +14,8 @@ import io
 import os
 import logging
 import asyncio
+import time as _time
+import threading as _threading
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 
@@ -25,6 +27,58 @@ logger = logging.getLogger(__name__)
 
 # Use real models unless STUB_MODE is set
 STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
+
+# --- Model idle unloading ---
+# Track last use time for each model type. When idle > timeout, unload
+# to free memory (~500MB CLIP, ~200MB ArcFace). Re-loads on next request.
+MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "120"))
+_model_last_used: dict[str, float] = {}
+_idle_monitor_started = False
+
+
+def _track_model_use(model_type: str) -> None:
+    """Record that a model was just used."""
+    _model_last_used[model_type] = _time.monotonic()
+
+
+def _start_idle_monitor() -> None:
+    """Start background thread that unloads idle models."""
+    global _idle_monitor_started
+    if _idle_monitor_started or STUB_MODE or MODEL_IDLE_TIMEOUT <= 0:
+        return
+    _idle_monitor_started = True
+
+    def _monitor():
+        while True:
+            _time.sleep(30)
+            now = _time.monotonic()
+            for model_type in list(_model_last_used.keys()):
+                idle_sec = now - _model_last_used.get(model_type, now)
+                if idle_sec < MODEL_IDLE_TIMEOUT:
+                    continue
+                try:
+                    if model_type == "clip":
+                        from .models import clip as clip_module
+                        with clip_module._model_lock:
+                            if clip_module._current_model is not None:
+                                clip_module._current_model.unload()
+                                clip_module._current_model = None
+                                clip_module._current_model_name = None
+                                logger.info("Unloaded CLIP model (idle %.0fs)", idle_sec)
+                        _model_last_used.pop("clip", None)
+                    elif model_type == "face":
+                        from .models import face_embed as face_module
+                        if face_module._recognition_model is not None:
+                            face_module.unload_recognition_model()
+                            logger.info("Unloaded face model (idle %.0fs)", idle_sec)
+                        _model_last_used.pop("face", None)
+                except Exception as e:
+                    logger.warning("Idle unload failed for %s: %s", model_type, e)
+
+    t = _threading.Thread(target=_monitor, daemon=True, name="model-idle-monitor")
+    t.start()
+    logger.info("Model idle monitor started (timeout=%ds)", MODEL_IDLE_TIMEOUT)
+
 
 if STUB_MODE:
     logger.warning("Running in STUB_MODE - returning fake data")
@@ -83,8 +137,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Max concurrent requests: {settings.max_concurrent_requests}")
     logger.info(f"Log level: {settings.log_level}")
     
+    _start_idle_monitor()
     yield
-    
+
     # Cleanup on shutdown - import modules to access current state
     logger.info("Shutting down immich-ml-metal service")
     if not STUB_MODE:
@@ -131,6 +186,7 @@ def get_clip(model_name: str = "ViT-B-32__openai"):
     if STUB_MODE:
         return None
     from .models.clip import get_clip_model
+    _track_model_use("clip")
     return get_clip_model(model_name)
 
 
@@ -156,6 +212,7 @@ def _run_face_recognition_sync(
     """Synchronous face recognition implementation."""
     from .models.face_detect import detect_faces
     from .models.face_embed import get_face_embedding, get_face_embedding_from_bbox
+    _track_model_use("face")
     
     faces, _, _ = detect_faces(image_bytes)
     
