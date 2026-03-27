@@ -42,12 +42,19 @@ MODEL_MEMORY_FLOOR_MB = int(os.getenv("MODEL_MEMORY_FLOOR_MB", "500"))
 # Minimum idle time before a model is eligible for pressure-based unloading
 _PRESSURE_IDLE_MIN_SEC = 30
 _model_last_used: dict[str, float] = {}
+_model_busy: set[str] = set()  # models currently loading or running inference
 _idle_monitor_started = False
 
 
 def _track_model_use(model_type: str) -> None:
-    """Record that a model was just used."""
+    """Record that a model was just used (call AFTER load/inference, not before)."""
     _model_last_used[model_type] = _time.monotonic()
+    _model_busy.discard(model_type)
+
+
+def _mark_model_busy(model_type: str) -> None:
+    """Mark a model as actively loading or running inference (unload-protected)."""
+    _model_busy.add(model_type)
 
 
 def _available_memory_mb() -> int:
@@ -75,6 +82,9 @@ def _should_unload(model_type: str, now: float, avail_mb: int) -> bool:
     avail_mb is passed in so the caller can check memory once per cycle,
     not once per model.
     """
+    if model_type in _model_busy:
+        return False  # model is loading or mid-inference, never unload
+
     last_used = _model_last_used.get(model_type, now)
     idle_sec = now - last_used
 
@@ -239,12 +249,20 @@ async def log_requests(request: Request, call_next):
 
 
 def get_clip(model_name: str = "ViT-B-32__openai"):
-    """Get CLIP model, loading on first use or switching if model changed."""
+    """Get CLIP model, loading on first use or switching if model changed.
+
+    Marks CLIP as busy (unload-protected) during load. Callers must call
+    _track_model_use("clip") after inference completes to release the guard.
+    """
     if STUB_MODE:
         return None
     from .models.clip import get_clip_model
-    _track_model_use("clip")
-    return get_clip_model(model_name)
+    _mark_model_busy("clip")
+    try:
+        return get_clip_model(model_name)
+    except Exception:
+        _model_busy.discard("clip")  # don't leave a permanent busy flag on load failure
+        raise
 
 
 async def run_face_recognition_async(
@@ -269,28 +287,31 @@ def _run_face_recognition_sync(
     """Synchronous face recognition implementation."""
     from .models.face_detect import detect_faces
     from .models.face_embed import get_face_embedding, get_face_embedding_from_bbox
-    _track_model_use("face")
-    
-    faces, _, _ = detect_faces(image_bytes)
-    
-    results = []
-    for face in faces:
-        if face["score"] < min_score:
-            continue
-        
-        if "landmarks" in face:
-            embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
-        else:
-            embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], model_name)
-        
-        if embedding is not None:
-            results.append({
-                "boundingBox": face["boundingBox"],
-                "embedding": str(embedding.tolist()),
-                "score": face["score"]
-            })
-    
-    return results
+    _mark_model_busy("face")
+
+    try:
+        faces, _, _ = detect_faces(image_bytes)
+
+        results = []
+        for face in faces:
+            if face["score"] < min_score:
+                continue
+
+            if "landmarks" in face:
+                embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
+            else:
+                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], model_name)
+
+            if embedding is not None:
+                results.append({
+                    "boundingBox": face["boundingBox"],
+                    "embedding": str(embedding.tolist()),
+                    "score": face["score"]
+                })
+
+        return results
+    finally:
+        _track_model_use("face")
 
 
 @app.get("/")
@@ -322,7 +343,8 @@ async def health():
         if not STUB_MODE:
             # Check CLIP model
             try:
-                clip = get_clip(settings.clip_model)
+                get_clip(settings.clip_model)
+                _track_model_use("clip")
                 health_status["checks"]["clip"] = "ok"
             except Exception as e:
                 logger.error(f"CLIP health check failed: {e}")
@@ -451,32 +473,38 @@ async def _process_predict(
         if task_type == "clip":
             if "visual" in task_config and image_bytes:
                 model_name = task_config["visual"].get("modelName", settings.clip_model)
-                
+
                 if STUB_MODE:
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
                     clip = get_clip(model_name)
-                    embedding = await asyncio.to_thread(
-                        clip.encode_image,
-                        image_bytes
-                    )
-                
+                    try:
+                        embedding = await asyncio.to_thread(
+                            clip.encode_image,
+                            image_bytes
+                        )
+                    finally:
+                        _track_model_use("clip")
+
                 response["clip"] = str(embedding.tolist())
-                
+
             elif "textual" in task_config and text:
                 model_name = task_config["textual"].get("modelName", settings.clip_model)
-                
+
                 if STUB_MODE:
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
                     clip = get_clip(model_name)
-                    embedding = await asyncio.to_thread(
-                        clip.encode_text,
-                        text
-                    )
-                
+                    try:
+                        embedding = await asyncio.to_thread(
+                            clip.encode_text,
+                            text
+                        )
+                    finally:
+                        _track_model_use("clip")
+
                 response["clip"] = str(embedding.tolist())
         
         elif task_type == "facial-recognition":
