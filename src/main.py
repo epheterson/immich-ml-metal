@@ -28,10 +28,19 @@ logger = logging.getLogger(__name__)
 # Use real models unless STUB_MODE is set
 STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
 
-# --- Model idle unloading ---
-# Track last use time for each model type. When idle > timeout, unload
-# to free memory (~500MB CLIP, ~200MB ArcFace). Re-loads on next request.
+# --- Model memory management ---
+# Models stay loaded for fast inference. Under memory pressure, idle models
+# are unloaded to prevent swap spirals. Re-loaded automatically on next request.
+#
+# MODEL_UNLOAD_STRATEGY:
+#   "pressure" (default) — only unload when available RAM is low AND model is idle
+#   "timeout"            — unload after MODEL_IDLE_TIMEOUT seconds of inactivity
+#   "never"              — keep models loaded permanently
+MODEL_UNLOAD_STRATEGY = os.getenv("MODEL_UNLOAD_STRATEGY", "pressure")
 MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "120"))
+MODEL_MEMORY_FLOOR_MB = int(os.getenv("MODEL_MEMORY_FLOOR_MB", "500"))
+# Minimum idle time before a model is eligible for pressure-based unloading
+_PRESSURE_IDLE_MIN_SEC = 30
 _model_last_used: dict[str, float] = {}
 _idle_monitor_started = False
 
@@ -41,10 +50,70 @@ def _track_model_use(model_type: str) -> None:
     _model_last_used[model_type] = _time.monotonic()
 
 
+def _available_memory_mb() -> int:
+    """Check available memory (free + inactive pages) via vm_stat."""
+    try:
+        import subprocess
+        import re
+        vm = subprocess.check_output(["vm_stat"], timeout=5).decode()
+        ps_match = re.search(r"page size of (\d+) bytes", vm)
+        page_size = int(ps_match.group(1)) if ps_match else 16384
+        free_match = re.search(r"Pages free:\s+(\d+)", vm)
+        inactive_match = re.search(r"Pages inactive:\s+(\d+)", vm)
+        if not free_match or not inactive_match:
+            return 9999
+        free = int(free_match.group(1))
+        inactive = int(inactive_match.group(1))
+        return (free + inactive) * page_size // (1024 * 1024)
+    except Exception:
+        return 9999
+
+
+def _should_unload(model_type: str, now: float, avail_mb: int) -> bool:
+    """Decide whether a model should be unloaded based on strategy.
+
+    avail_mb is passed in so the caller can check memory once per cycle,
+    not once per model.
+    """
+    last_used = _model_last_used.get(model_type, now)
+    idle_sec = now - last_used
+
+    if MODEL_UNLOAD_STRATEGY == "never":
+        return False
+    elif MODEL_UNLOAD_STRATEGY == "timeout":
+        return idle_sec >= MODEL_IDLE_TIMEOUT
+    else:  # "pressure" — default
+        if idle_sec < _PRESSURE_IDLE_MIN_SEC:
+            return False  # actively in use, don't touch
+        return avail_mb < MODEL_MEMORY_FLOOR_MB
+
+
+def _unload_model(model_type: str, reason: str) -> None:
+    """Unload a specific model and log the reason."""
+    try:
+        if model_type == "clip":
+            from .models import clip as clip_module
+            with clip_module._model_lock:
+                if clip_module._current_model is not None:
+                    clip_module._current_model.unload()
+                    clip_module._current_model = None
+                    clip_module._current_model_name = None
+                    logger.info("Unloaded CLIP model (%s)", reason)
+            _model_last_used.pop("clip", None)
+        elif model_type == "face":
+            from .models import face_embed as face_module
+            if face_module._recognition_model is not None:
+                face_module.unload_recognition_model()
+                logger.info("Unloaded face model (%s)", reason)
+            _model_last_used.pop("face", None)
+    except Exception as e:
+        logger.warning("Model unload failed for %s: %s", model_type, e)
+
+
 def _start_idle_monitor() -> None:
-    """Start background thread that unloads idle models."""
+    """Start background thread that manages model memory."""
     global _idle_monitor_started
-    if _idle_monitor_started or STUB_MODE or MODEL_IDLE_TIMEOUT <= 0:
+    if _idle_monitor_started or STUB_MODE or MODEL_UNLOAD_STRATEGY == "never":
         return
     _idle_monitor_started = True
 
@@ -52,32 +121,20 @@ def _start_idle_monitor() -> None:
         while True:
             _time.sleep(30)
             now = _time.monotonic()
+            avail_mb = _available_memory_mb()
             for model_type in list(_model_last_used.keys()):
-                idle_sec = now - _model_last_used.get(model_type, now)
-                if idle_sec < MODEL_IDLE_TIMEOUT:
-                    continue
-                try:
-                    if model_type == "clip":
-                        from .models import clip as clip_module
-                        with clip_module._model_lock:
-                            if clip_module._current_model is not None:
-                                clip_module._current_model.unload()
-                                clip_module._current_model = None
-                                clip_module._current_model_name = None
-                                logger.info("Unloaded CLIP model (idle %.0fs)", idle_sec)
-                        _model_last_used.pop("clip", None)
-                    elif model_type == "face":
-                        from .models import face_embed as face_module
-                        if face_module._recognition_model is not None:
-                            face_module.unload_recognition_model()
-                            logger.info("Unloaded face model (idle %.0fs)", idle_sec)
-                        _model_last_used.pop("face", None)
-                except Exception as e:
-                    logger.warning("Idle unload failed for %s: %s", model_type, e)
+                if _should_unload(model_type, now, avail_mb):
+                    idle_sec = now - _model_last_used.get(model_type, now)
+                    if MODEL_UNLOAD_STRATEGY == "timeout":
+                        reason = "idle %.0fs" % idle_sec
+                    else:
+                        reason = "memory pressure, %dMB available, idle %.0fs" % (
+                            avail_mb, idle_sec)
+                    _unload_model(model_type, reason)
 
-    t = _threading.Thread(target=_monitor, daemon=True, name="model-idle-monitor")
+    t = _threading.Thread(target=_monitor, daemon=True, name="model-memory-monitor")
     t.start()
-    logger.info("Model idle monitor started (timeout=%ds)", MODEL_IDLE_TIMEOUT)
+    logger.info("Model memory monitor started (strategy=%s)", MODEL_UNLOAD_STRATEGY)
 
 
 if STUB_MODE:
