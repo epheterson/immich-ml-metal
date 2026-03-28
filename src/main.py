@@ -14,6 +14,8 @@ import io
 import os
 import logging
 import asyncio
+import time as _time
+import threading as _threading
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 
@@ -25,6 +27,125 @@ logger = logging.getLogger(__name__)
 
 # Use real models unless STUB_MODE is set
 STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
+
+# --- Model memory management ---
+# Models stay loaded for fast inference. Under memory pressure, idle models
+# are unloaded to prevent swap spirals. Re-loaded automatically on next request.
+#
+# MODEL_UNLOAD_STRATEGY:
+#   "pressure" (default) — only unload when available RAM is low AND model is idle
+#   "timeout"            — unload after MODEL_IDLE_TIMEOUT seconds of inactivity
+#   "never"              — keep models loaded permanently
+MODEL_UNLOAD_STRATEGY = os.getenv("MODEL_UNLOAD_STRATEGY", "pressure")
+MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "120"))
+MODEL_MEMORY_FLOOR_MB = int(os.getenv("MODEL_MEMORY_FLOOR_MB", "500"))
+# Minimum idle time before a model is eligible for pressure-based unloading
+_PRESSURE_IDLE_MIN_SEC = 30
+_model_last_used: dict[str, float] = {}
+_model_busy: set[str] = set()  # models currently loading or running inference
+_idle_monitor_started = False
+
+
+def _track_model_use(model_type: str) -> None:
+    """Record that a model was just used (call AFTER load/inference, not before)."""
+    _model_last_used[model_type] = _time.monotonic()
+    _model_busy.discard(model_type)
+
+
+def _mark_model_busy(model_type: str) -> None:
+    """Mark a model as actively loading or running inference (unload-protected)."""
+    _model_busy.add(model_type)
+
+
+def _available_memory_mb() -> int:
+    """Check available memory (free + inactive pages) via vm_stat."""
+    try:
+        import subprocess
+        import re
+        vm = subprocess.check_output(["vm_stat"], timeout=5).decode()
+        ps_match = re.search(r"page size of (\d+) bytes", vm)
+        page_size = int(ps_match.group(1)) if ps_match else 16384
+        free_match = re.search(r"Pages free:\s+(\d+)", vm)
+        inactive_match = re.search(r"Pages inactive:\s+(\d+)", vm)
+        if not free_match or not inactive_match:
+            return 9999
+        free = int(free_match.group(1))
+        inactive = int(inactive_match.group(1))
+        return (free + inactive) * page_size // (1024 * 1024)
+    except Exception:
+        return 9999
+
+
+def _should_unload(model_type: str, now: float, avail_mb: int) -> bool:
+    """Decide whether a model should be unloaded based on strategy.
+
+    avail_mb is passed in so the caller can check memory once per cycle,
+    not once per model.
+    """
+    if model_type in _model_busy:
+        return False  # model is loading or mid-inference, never unload
+
+    last_used = _model_last_used.get(model_type, now)
+    idle_sec = now - last_used
+
+    if MODEL_UNLOAD_STRATEGY == "never":
+        return False
+    elif MODEL_UNLOAD_STRATEGY == "timeout":
+        return idle_sec >= MODEL_IDLE_TIMEOUT
+    else:  # "pressure" — default
+        if idle_sec < _PRESSURE_IDLE_MIN_SEC:
+            return False  # actively in use, don't touch
+        return avail_mb < MODEL_MEMORY_FLOOR_MB
+
+
+def _unload_model(model_type: str, reason: str) -> None:
+    """Unload a specific model and log the reason."""
+    try:
+        if model_type == "clip":
+            from .models import clip as clip_module
+            with clip_module._model_lock:
+                if clip_module._current_model is not None:
+                    clip_module._current_model.unload()
+                    clip_module._current_model = None
+                    clip_module._current_model_name = None
+                    logger.info("Unloaded CLIP model (%s)", reason)
+            _model_last_used.pop("clip", None)
+        elif model_type == "face":
+            from .models import face_embed as face_module
+            if face_module._recognition_model is not None:
+                face_module.unload_recognition_model()
+                logger.info("Unloaded face model (%s)", reason)
+            _model_last_used.pop("face", None)
+    except Exception as e:
+        logger.warning("Model unload failed for %s: %s", model_type, e)
+
+
+def _start_idle_monitor() -> None:
+    """Start background thread that manages model memory."""
+    global _idle_monitor_started
+    if _idle_monitor_started or STUB_MODE or MODEL_UNLOAD_STRATEGY == "never":
+        return
+    _idle_monitor_started = True
+
+    def _monitor():
+        while True:
+            _time.sleep(30)
+            now = _time.monotonic()
+            avail_mb = _available_memory_mb()
+            for model_type in list(_model_last_used.keys()):
+                if _should_unload(model_type, now, avail_mb):
+                    idle_sec = now - _model_last_used.get(model_type, now)
+                    if MODEL_UNLOAD_STRATEGY == "timeout":
+                        reason = "idle %.0fs" % idle_sec
+                    else:
+                        reason = "memory pressure, %dMB available, idle %.0fs" % (
+                            avail_mb, idle_sec)
+                    _unload_model(model_type, reason)
+
+    t = _threading.Thread(target=_monitor, daemon=True, name="model-memory-monitor")
+    t.start()
+    logger.info("Model memory monitor started (strategy=%s)", MODEL_UNLOAD_STRATEGY)
+
 
 if STUB_MODE:
     logger.warning("Running in STUB_MODE - returning fake data")
@@ -83,8 +204,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Max concurrent requests: {settings.max_concurrent_requests}")
     logger.info(f"Log level: {settings.log_level}")
     
+    _start_idle_monitor()
     yield
-    
+
     # Cleanup on shutdown - import modules to access current state
     logger.info("Shutting down immich-ml-metal service")
     if not STUB_MODE:
@@ -127,11 +249,20 @@ async def log_requests(request: Request, call_next):
 
 
 def get_clip(model_name: str = "ViT-B-32__openai"):
-    """Get CLIP model, loading on first use or switching if model changed."""
+    """Get CLIP model, loading on first use or switching if model changed.
+
+    Marks CLIP as busy (unload-protected) during load. Callers must call
+    _track_model_use("clip") after inference completes to release the guard.
+    """
     if STUB_MODE:
         return None
     from .models.clip import get_clip_model
-    return get_clip_model(model_name)
+    _mark_model_busy("clip")
+    try:
+        return get_clip_model(model_name)
+    except Exception:
+        _model_busy.discard("clip")  # don't leave a permanent busy flag on load failure
+        raise
 
 
 async def run_face_recognition_async(
@@ -156,27 +287,31 @@ def _run_face_recognition_sync(
     """Synchronous face recognition implementation."""
     from .models.face_detect import detect_faces
     from .models.face_embed import get_face_embedding, get_face_embedding_from_bbox
-    
-    faces, _, _ = detect_faces(image_bytes)
-    
-    results = []
-    for face in faces:
-        if face["score"] < min_score:
-            continue
-        
-        if "landmarks" in face:
-            embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
-        else:
-            embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], model_name)
-        
-        if embedding is not None:
-            results.append({
-                "boundingBox": face["boundingBox"],
-                "embedding": str(embedding.tolist()),
-                "score": face["score"]
-            })
-    
-    return results
+    _mark_model_busy("face")
+
+    try:
+        faces, _, _ = detect_faces(image_bytes)
+
+        results = []
+        for face in faces:
+            if face["score"] < min_score:
+                continue
+
+            if "landmarks" in face:
+                embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
+            else:
+                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], model_name)
+
+            if embedding is not None:
+                results.append({
+                    "boundingBox": face["boundingBox"],
+                    "embedding": str(embedding.tolist()),
+                    "score": face["score"]
+                })
+
+        return results
+    finally:
+        _track_model_use("face")
 
 
 @app.get("/")
@@ -208,7 +343,8 @@ async def health():
         if not STUB_MODE:
             # Check CLIP model
             try:
-                clip = get_clip(settings.clip_model)
+                get_clip(settings.clip_model)
+                _track_model_use("clip")
                 health_status["checks"]["clip"] = "ok"
             except Exception as e:
                 logger.error(f"CLIP health check failed: {e}")
@@ -337,32 +473,38 @@ async def _process_predict(
         if task_type == "clip":
             if "visual" in task_config and image_bytes:
                 model_name = task_config["visual"].get("modelName", settings.clip_model)
-                
+
                 if STUB_MODE:
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
                     clip = get_clip(model_name)
-                    embedding = await asyncio.to_thread(
-                        clip.encode_image,
-                        image_bytes
-                    )
-                
+                    try:
+                        embedding = await asyncio.to_thread(
+                            clip.encode_image,
+                            image_bytes
+                        )
+                    finally:
+                        _track_model_use("clip")
+
                 response["clip"] = str(embedding.tolist())
-                
+
             elif "textual" in task_config and text:
                 model_name = task_config["textual"].get("modelName", settings.clip_model)
-                
+
                 if STUB_MODE:
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
                     clip = get_clip(model_name)
-                    embedding = await asyncio.to_thread(
-                        clip.encode_text,
-                        text
-                    )
-                
+                    try:
+                        embedding = await asyncio.to_thread(
+                            clip.encode_text,
+                            text
+                        )
+                    finally:
+                        _track_model_use("clip")
+
                 response["clip"] = str(embedding.tolist())
         
         elif task_type == "facial-recognition":

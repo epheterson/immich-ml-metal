@@ -83,6 +83,9 @@ Configure via environment variables or edit `src/config.py`:
 | `ML_USE_COREML` | `true` | Enable CoreML acceleration |
 | `ML_USE_ANE` | `true` | Enable Apple Neural Engine |
 | `ML_MAX_CONCURRENT_REQUESTS` | `4` | Max queued requests before backpressure |
+| `MODEL_UNLOAD_STRATEGY` | `pressure` | `pressure`: unload when RAM is low + idle. `timeout`: unload after idle timeout. `never`: keep loaded. |
+| `MODEL_IDLE_TIMEOUT` | `120` | Seconds before unloading idle models (only used with `timeout` strategy) |
+| `MODEL_MEMORY_FLOOR_MB` | `500` | Available RAM threshold that triggers model unloading (only used with `pressure` strategy) |
 | `ML_LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG/INFO/WARNING/ERROR) |
 | `ML_LOG_REQUESTS` | `true` | Log individual requests (disable for high volume) |
 | `ML_DEBUG_MODE` | `false` | Expose error details (keep false when network-exposed) |
