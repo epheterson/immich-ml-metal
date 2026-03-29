@@ -9,14 +9,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from PIL import Image
-from pathlib import Path
 from typing import Optional
 import io
 import gc
 import logging
 import threading
-import tempfile
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -50,86 +47,6 @@ OPENCLIP_MAP = {
 }
 
 
-class ImageBufferManager:
-    """
-    Manages image data for mlx_clip which requires file paths.
-    
-    Prefers RAM (via named pipes/memory) but overflows to disk when
-    the RAM budget is exceeded. Thread-safe.
-    """
-    
-    def __init__(self, ram_limit_mb: int = 256):
-        self._ram_limit = ram_limit_mb * 1024 * 1024
-        self._current_ram_usage = 0
-        self._lock = threading.Lock()
-        self._active_buffers: dict[str, int] = {}  # path -> size
-    
-    def get_image_path(self, image: Image.Image) -> tuple[str, bool]:
-        """
-        Get a file path for the image that mlx_clip can read.
-        
-        Returns:
-            Tuple of (path, is_temp_file). Caller must call release_path() when done.
-        """
-        # Estimate size (JPEG is typically smaller than raw)
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=95)
-        img_size = buffer.tell()
-        buffer.seek(0)
-        img_bytes = buffer.getvalue()
-        
-        with self._lock:
-            use_ram = (self._current_ram_usage + img_size) <= self._ram_limit
-            
-            if use_ram:
-                # Use temp file but track RAM usage
-                # On macOS, small temp files often stay in buffer cache
-                self._current_ram_usage += img_size
-        
-        # Always use tempfile (macOS handles caching efficiently)
-        # but track whether we're within RAM budget for monitoring
-        fd, path = tempfile.mkstemp(suffix=".jpg", prefix="clip_")
-        try:
-            os.write(fd, img_bytes)
-        finally:
-            os.close(fd)
-        
-        with self._lock:
-            self._active_buffers[path] = img_size
-        
-        return path, True
-    
-    def release_path(self, path: str):
-        """Release a path obtained from get_image_path."""
-        with self._lock:
-            size = self._active_buffers.pop(path, 0)
-            if self._current_ram_usage >= size:
-                self._current_ram_usage -= size
-        
-        try:
-            os.unlink(path)
-        except OSError as e:
-            logger.warning(f"Failed to cleanup temp file {path}: {e}")
-    
-    @property
-    def ram_usage_mb(self) -> float:
-        with self._lock:
-            return self._current_ram_usage / (1024 * 1024)
-
-
-# Global buffer manager (initialized lazily with settings)
-_buffer_manager: Optional[ImageBufferManager] = None
-_buffer_lock = threading.Lock()
-
-
-def get_buffer_manager() -> ImageBufferManager:
-    """Get or create the global buffer manager."""
-    global _buffer_manager
-    with _buffer_lock:
-        if _buffer_manager is None:
-            from ..config import settings
-            _buffer_manager = ImageBufferManager(settings.clip_buffer_ram_limit_mb)
-        return _buffer_manager
 
 
 class MLXClip:
@@ -233,70 +150,87 @@ class MLXClip:
     def encode_image(self, image_bytes: bytes) -> np.ndarray:
         """
         Generate CLIP embedding for an image.
-        Thread-safe - only one inference at a time to prevent Metal conflicts.
+        Thread-safe — only GPU inference is serialized. Image decode and
+        preprocessing run outside the lock.
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded")
-        
+
+        # Decode outside lock — this is CPU work, not GPU
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        if hasattr(self, '_use_fallback') and self._use_fallback:
+            return self._encode_image_fallback(image)
+
+        # MLX path — preprocess the PIL image directly (no temp file needed).
+        # mlx_clip's image_encoder opens a file path then calls img_processor;
+        # we skip the file I/O and call the processor ourselves.
+        processed = self._model.img_processor([image])
+
         with self._inference_lock:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            
-            if hasattr(self, '_use_fallback') and self._use_fallback:
-                return self._encode_image_fallback(image)
-            
-            # MLX path - use buffer manager for efficient temp file handling
-            buffer_mgr = get_buffer_manager()
-            temp_path, _ = buffer_mgr.get_image_path(image)
-            
-            try:
-                embedding = self._model.image_encoder(temp_path)
-                if isinstance(embedding, mx.array):
-                    embedding = np.array(embedding)
-                embedding = embedding / np.linalg.norm(embedding)
-                return embedding.flatten().astype(np.float32)
-            finally:
-                buffer_mgr.release_path(temp_path)
+            output = self._model.model(**{"pixel_values": processed})
+            embedding = output.image_embeds[0]
+
+        if isinstance(embedding, mx.array):
+            embedding = np.array(embedding)
+        embedding = embedding / np.linalg.norm(embedding)
+        return embedding.flatten().astype(np.float32)
     
     def _encode_image_fallback(self, image: Image.Image) -> np.ndarray:
-        """Encode image using open_clip fallback (assumes lock is held)."""
+        """Encode image using open_clip fallback.
+
+        Preprocessing (resize/normalize) runs outside the lock since it's
+        CPU-only. Only the MPS/GPU inference is serialized.
+        """
         import torch
-        
+
+        # Preprocess outside lock — self._processor is a stateless
+        # torchvision.transforms.Compose; model unload is blocked while busy.
         image_tensor = self._processor(image).unsqueeze(0).to(self._device)
-        
-        with torch.no_grad():
-            embedding = self._model.encode_image(image_tensor)
-            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-        
+
+        # Only hold lock for GPU inference
+        with self._inference_lock:
+            with torch.no_grad():
+                embedding = self._model.encode_image(image_tensor)
+                embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+
         return embedding.squeeze().cpu().numpy().astype(np.float32)
     
     def encode_text(self, text: str) -> np.ndarray:
         """
         Generate CLIP embedding for text.
-        Thread-safe - only one inference at a time to prevent Metal conflicts.
+        Thread-safe — only GPU inference is serialized, matching encode_image.
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded")
-        
+
+        if hasattr(self, '_use_fallback') and self._use_fallback:
+            return self._encode_text_fallback(text)
+
         with self._inference_lock:
-            if hasattr(self, '_use_fallback') and self._use_fallback:
-                return self._encode_text_fallback(text)
-            
             embedding = self._model.text_encoder(text)
             if isinstance(embedding, mx.array):
                 embedding = np.array(embedding)
             embedding = embedding / np.linalg.norm(embedding)
             return embedding.flatten().astype(np.float32)
-    
+
     def _encode_text_fallback(self, text: str) -> np.ndarray:
-        """Encode text using open_clip fallback (assumes lock is held)."""
+        """Encode text using open_clip fallback.
+
+        Tokenization runs outside the lock since it's CPU-only.
+        Only the MPS/GPU inference is serialized, matching _encode_image_fallback.
+        """
         import torch
-        
+
+        # Tokenize outside lock — CPU-only work
         tokens = self._tokenizer([text]).to(self._device)
-        
-        with torch.no_grad():
-            embedding = self._model.encode_text(tokens)
-            embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-        
+
+        # Only hold lock for GPU inference
+        with self._inference_lock:
+            with torch.no_grad():
+                embedding = self._model.encode_text(tokens)
+                embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+
         return embedding.squeeze().cpu().numpy().astype(np.float32)
     
     def unload(self):
@@ -371,5 +305,4 @@ if __name__ == "__main__":
         similarity = np.dot(text_emb, img_emb)
         logger.info(f"Text-image similarity: {similarity:.4f}")
     
-    logger.info(f"\nBuffer manager RAM usage: {get_buffer_manager().ram_usage_mb:.2f} MB")
     logger.info("\n✅ CLIP tests passed!")

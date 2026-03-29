@@ -7,6 +7,7 @@ Drop-in replacement for Immich's ML service, optimized for Apple Silicon.
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
 from fastapi.responses import ORJSONResponse, PlainTextResponse, JSONResponse
 from typing import Optional
+from functools import partial
 import json
 import numpy as np
 from PIL import Image
@@ -14,6 +15,7 @@ import io
 import os
 import logging
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import time as _time
 import threading as _threading
 from contextlib import asynccontextmanager
@@ -147,6 +149,16 @@ def _start_idle_monitor() -> None:
     logger.info("Model memory monitor started (strategy=%s)", MODEL_UNLOAD_STRATEGY)
 
 
+# Dedicated thread pool for ML inference — reuses threads instead of
+# creating a new one per asyncio.to_thread() call.
+_inference_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ml-inference")
+
+
+def _run_in_pool(fn, *args):
+    """Run a sync function in the inference thread pool."""
+    return asyncio.get_running_loop().run_in_executor(_inference_pool, fn, *args)
+
+
 if STUB_MODE:
     logger.warning("Running in STUB_MODE - returning fake data")
 
@@ -228,6 +240,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error during model cleanup: {e}")
 
+    _inference_pool.shutdown(wait=False)
+
 
 app = FastAPI(
     title="immich-ml-metal",
@@ -271,7 +285,7 @@ async def run_face_recognition_async(
     model_name: str
 ) -> list[dict]:
     """Run face detection and embedding generation (async wrapper)."""
-    return await asyncio.to_thread(
+    return await _run_in_pool(
         _run_face_recognition_sync,
         image_bytes,
         min_score,
@@ -284,24 +298,37 @@ def _run_face_recognition_sync(
     min_score: float,
     model_name: str
 ) -> list[dict]:
-    """Synchronous face recognition implementation."""
+    """Synchronous face recognition implementation.
+
+    Decodes the image once, filters by min_score, then runs a single
+    batched ONNX inference for all qualifying faces.
+    """
+    import cv2
     from .models.face_detect import detect_faces
-    from .models.face_embed import get_face_embedding, get_face_embedding_from_bbox
+    from .models.face_embed import get_face_embeddings_batch
     _mark_model_busy("face")
 
     try:
         faces, _, _ = detect_faces(image_bytes)
 
+        # Filter by score first — no point aligning faces we'll discard
+        scored_faces = [f for f in faces if f["score"] >= min_score]
+        if not scored_faces:
+            return []
+
+        # Decode image once for all faces
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            logger.error("Failed to decode image for face recognition")
+            return []
+
+        # Single batched inference
+        embeddings = get_face_embeddings_batch(img_bgr, scored_faces, model_name)
+
+        # Build results, skipping any faces where embedding failed
         results = []
-        for face in faces:
-            if face["score"] < min_score:
-                continue
-
-            if "landmarks" in face:
-                embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
-            else:
-                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], model_name)
-
+        for face, embedding in zip(scored_faces, embeddings):
             if embedding is not None:
                 results.append({
                     "boundingBox": face["boundingBox"],
@@ -467,110 +494,155 @@ async def _process_predict(
             logger.error(f"Failed to read/decode image: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
     
-    # Process each requested task
-    for task_type, task_config in tasks.items():
-        
-        if task_type == "clip":
-            if "visual" in task_config and image_bytes:
-                model_name = task_config["visual"].get("modelName", settings.clip_model)
+    # Build concurrent coroutines for each requested task.
+    # CLIP hits GPU/Metal, face detection hits ANE (Vision), face embedding hits
+    # CPU/CoreML (ONNX), and OCR hits ANE (Vision). Face detection and OCR share
+    # the ANE but macOS schedules Vision requests internally. CLIP and face
+    # embedding are on fully independent compute units.
+    coroutines = []
 
-                if STUB_MODE:
-                    embedding = np.random.randn(512).astype(np.float32)
-                    embedding = embedding / np.linalg.norm(embedding)
-                else:
-                    clip = get_clip(model_name)
-                    try:
-                        embedding = await asyncio.to_thread(
-                            clip.encode_image,
-                            image_bytes
-                        )
-                    finally:
-                        _track_model_use("clip")
+    async def _timed(name, coro):
+        """Wrap a coroutine with timing instrumentation."""
+        t0 = _time.monotonic()
+        result = await coro
+        elapsed = (_time.monotonic() - t0) * 1000
+        if result is not None:
+            logger.info("  %s: %.0fms", name, elapsed)
+        return result
 
-                response["clip"] = str(embedding.tolist())
+    async def _run_clip(task_config):
+        """Run CLIP embedding (visual or textual). Returns ("clip", value) or None."""
+        if "visual" in task_config and image_bytes:
+            model_name = task_config["visual"].get("modelName", settings.clip_model)
 
-            elif "textual" in task_config and text:
-                model_name = task_config["textual"].get("modelName", settings.clip_model)
-
-                if STUB_MODE:
-                    embedding = np.random.randn(512).astype(np.float32)
-                    embedding = embedding / np.linalg.norm(embedding)
-                else:
-                    clip = get_clip(model_name)
-                    try:
-                        embedding = await asyncio.to_thread(
-                            clip.encode_text,
-                            text
-                        )
-                    finally:
-                        _track_model_use("clip")
-
-                response["clip"] = str(embedding.tolist())
-        
-        elif task_type == "facial-recognition":
-            if image_bytes is None:
-                continue
-                
-            detection_config = task_config.get("detection", {})
-            recognition_config = task_config.get("recognition", {})
-            
-            min_score = detection_config.get("options", {}).get(
-                "minScore", 
-                settings.face_min_score
-            )
-            model_name = recognition_config.get("modelName", settings.face_model)
-            
             if STUB_MODE:
-                fake_embedding = np.random.randn(512).astype(np.float32).tolist()
-                faces = [
-                    {
-                        "boundingBox": {
-                            "x1": int(img.width * 0.25),
-                            "y1": int(img.height * 0.15),
-                            "x2": int(img.width * 0.75),
-                            "y2": int(img.height * 0.85)
-                        },
-                        "embedding": str(fake_embedding),
-                        "score": 0.99
-                    }
-                ]
+                embedding = np.random.randn(512).astype(np.float32)
+                embedding = embedding / np.linalg.norm(embedding)
             else:
-                faces = await run_face_recognition_async(
-                    image_bytes,
-                    min_score,
-                    model_name
-                )
-            
-            response["facial-recognition"] = faces
-        
-        elif task_type == "ocr":
-            if image_bytes is None:
-                continue
-                
-            detection_config = task_config.get("detection", {})
-            recognition_config = task_config.get("recognition", {})
-            
-            min_detection_score = detection_config.get("options", {}).get("minScore", 0.0)
-            min_recognition_score = recognition_config.get("options", {}).get("minScore", 0.0)
-            min_score = max(min_detection_score, min_recognition_score)
-            
+                clip = get_clip(model_name)
+                try:
+                    embedding = await _run_in_pool(
+                        clip.encode_image,
+                        image_bytes
+                    )
+                finally:
+                    _track_model_use("clip")
+
+            return ("clip", str(embedding.tolist()))
+
+        elif "textual" in task_config and text:
+            model_name = task_config["textual"].get("modelName", settings.clip_model)
+
             if STUB_MODE:
-                response["ocr"] = {
-                    "text": ["placeholder", "text"],
-                    "box": [0, 0, 100, 0, 100, 50, 0, 50, 0, 50, 100, 50, 100, 100, 0, 100],
-                    "boxScore": [0.95, 0.92],
-                    "textScore": [0.98, 0.96]
+                embedding = np.random.randn(512).astype(np.float32)
+                embedding = embedding / np.linalg.norm(embedding)
+            else:
+                clip = get_clip(model_name)
+                try:
+                    embedding = await _run_in_pool(
+                        clip.encode_text,
+                        text
+                    )
+                finally:
+                    _track_model_use("clip")
+
+            return ("clip", str(embedding.tolist()))
+
+        return None
+
+    async def _run_faces(task_config):
+        """Run facial recognition. Returns ("facial-recognition", value) or None."""
+        if image_bytes is None:
+            return None
+
+        detection_config = task_config.get("detection", {})
+        recognition_config = task_config.get("recognition", {})
+
+        min_score = detection_config.get("options", {}).get(
+            "minScore",
+            settings.face_min_score
+        )
+        model_name = recognition_config.get("modelName", settings.face_model)
+
+        if STUB_MODE:
+            fake_embedding = np.random.randn(512).astype(np.float32).tolist()
+            faces = [
+                {
+                    "boundingBox": {
+                        "x1": int(img.width * 0.25),
+                        "y1": int(img.height * 0.15),
+                        "x2": int(img.width * 0.75),
+                        "y2": int(img.height * 0.85)
+                    },
+                    "embedding": str(fake_embedding),
+                    "score": 0.99
                 }
-            else:
-                from .models.ocr import recognize_text
-                ocr_result = await asyncio.to_thread(
-                    recognize_text,
-                    image_bytes,
-                    min_confidence=min_score,
-                    use_language_correction=settings.ocr_use_language_correction
-                )
-                response["ocr"] = ocr_result
-    
+            ]
+        else:
+            faces = await run_face_recognition_async(
+                image_bytes,
+                min_score,
+                model_name
+            )
+
+        logger.info("  faces: %d detected", len(faces))
+        return ("facial-recognition", faces)
+
+    async def _run_ocr(task_config):
+        """Run OCR text recognition. Returns ("ocr", value) or None."""
+        if image_bytes is None:
+            return None
+
+        detection_config = task_config.get("detection", {})
+        recognition_config = task_config.get("recognition", {})
+
+        min_detection_score = detection_config.get("options", {}).get("minScore", 0.0)
+        min_recognition_score = recognition_config.get("options", {}).get("minScore", 0.0)
+        min_score = max(min_detection_score, min_recognition_score)
+
+        if STUB_MODE:
+            return ("ocr", {
+                "text": ["placeholder", "text"],
+                "box": [0, 0, 100, 0, 100, 50, 0, 50, 0, 50, 100, 50, 100, 100, 0, 100],
+                "boxScore": [0.95, 0.92],
+                "textScore": [0.98, 0.96]
+            })
+        else:
+            from .models.ocr import recognize_text
+            ocr_result = await _run_in_pool(
+                partial(recognize_text, image_bytes,
+                        min_confidence=min_score,
+                        use_language_correction=settings.ocr_use_language_correction)
+            )
+            return ("ocr", ocr_result)
+
+    for task_type, task_config in tasks.items():
+        if task_type == "clip":
+            coroutines.append(_timed("clip", _run_clip(task_config)))
+        elif task_type == "facial-recognition":
+            coroutines.append(_timed("faces", _run_faces(task_config)))
+        elif task_type == "ocr":
+            coroutines.append(_timed("ocr", _run_ocr(task_config)))
+
+    # Run all tasks concurrently — they hit independent compute units.
+    # return_exceptions=True so one failure doesn't cancel the others
+    # (matches the old sequential behaviour where each task was independent).
+    t_start = _time.monotonic()
+    results = await asyncio.gather(*coroutines, return_exceptions=True)
+    total_ms = (_time.monotonic() - t_start) * 1000
+
+    task_names = [t for t in tasks.keys() if t in ("clip", "facial-recognition", "ocr")]
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.error("Task failed during concurrent execution: %s", result)
+            continue
+        if result is not None:
+            key, value = result
+            response[key] = value
+
+    logger.info("predict: %d task(s) [%s] completed in %.0fms",
+                len(task_names), "+".join(task_names), total_ms)
+
     # Validate response against schema - fail loudly if validation fails
     try:
         validated_response = PredictResponse(**response)

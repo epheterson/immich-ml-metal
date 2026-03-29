@@ -279,6 +279,103 @@ def get_face_embedding(
     return embedding.astype(np.float32)
 
 
+def get_face_embeddings_batch(
+    img_bgr: np.ndarray,
+    faces: list[dict],
+    model_name: str = "buffalo_l"
+) -> list[Optional[np.ndarray]]:
+    """
+    Generate embeddings for multiple faces in a single batched ONNX inference.
+
+    Decodes once, aligns all faces, runs one get_feat() call for the whole batch.
+    For N faces this turns N image-decodes + N inferences into 0 decodes + 1 inference
+    (caller supplies the already-decoded BGR image).
+
+    Args:
+        img_bgr: Pre-decoded BGR image (np.ndarray from cv2.imdecode).
+        faces: List of face dicts, each with 'boundingBox' and optionally 'landmarks'.
+        model_name: InsightFace model to use.
+
+    Returns:
+        List of 512-dim normalized embeddings (or None for faces that failed alignment),
+        in the same order as the input faces list.
+    """
+    if not faces:
+        return []
+
+    try:
+        from insightface.utils import face_align
+    except ImportError as e:
+        logger.error("insightface not available")
+        raise RuntimeError("Install insightface: pip install insightface") from e
+
+    # --- Align every face (landmark-based preferred, bbox crop fallback) ---
+    aligned: list[Optional[np.ndarray]] = []
+    for face in faces:
+        try:
+            if "landmarks" in face:
+                kps = np.array(face["landmarks"], dtype=np.float32)
+                aligned.append(
+                    face_align.norm_crop(img_bgr, kps, image_size=ARCFACE_INPUT_SIZE)
+                )
+            else:
+                bbox = face["boundingBox"]
+                x1, y1 = int(bbox["x1"]), int(bbox["y1"])
+                x2, y2 = int(bbox["x2"]), int(bbox["y2"])
+                w, h = x2 - x1, y2 - y1
+                pad_x, pad_y = int(w * 0.1), int(h * 0.1)
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(img_bgr.shape[1], x2 + pad_x)
+                y2 = min(img_bgr.shape[0], y2 + pad_y)
+                crop = img_bgr[y1:y2, x1:x2]
+                if crop.size == 0:
+                    logger.warning("Empty face crop for bbox %s", bbox)
+                    aligned.append(None)
+                    continue
+                aligned.append(
+                    cv2.resize(crop, (ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE))
+                )
+        except Exception as e:
+            logger.warning("Face alignment failed for face %s: %s", face.get("boundingBox"), e)
+            aligned.append(None)
+
+    # Collect indices that actually produced an aligned image
+    valid_indices = [i for i, a in enumerate(aligned) if a is not None]
+    if not valid_indices:
+        return [None] * len(faces)
+
+    # get_feat() expects a list of images, not a stacked array —
+    # it calls cv2.dnn.blobFromImages() internally for preprocessing.
+    batch = [aligned[i] for i in valid_indices]
+
+    # --- Single batched inference ---
+    model = get_recognition_model(model_name)
+
+    with _inference_lock:
+        try:
+            raw_embeddings = model.get_feat(batch)
+        except Exception as e:
+            logger.error("Batched embedding inference failed: %s", e)
+            return [None] * len(faces)
+
+    # raw_embeddings shape: (N, 512) — normalise each row
+    if raw_embeddings.ndim == 1:
+        # Single face came back flat
+        raw_embeddings = raw_embeddings.reshape(1, -1)
+
+    # --- Map results back to input order ---
+    results: list[Optional[np.ndarray]] = [None] * len(faces)
+    for batch_idx, face_idx in enumerate(valid_indices):
+        emb = raw_embeddings[batch_idx].flatten().astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        results[face_idx] = emb
+
+    return results
+
+
 def get_face_embedding_from_bbox(
     image_bytes: bytes,
     bbox: dict,
