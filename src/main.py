@@ -156,8 +156,14 @@ _inference_pool = ThreadPoolExecutor(
 )
 
 
+
 def _run_in_pool(fn, *args):
-    """Run a sync function in the inference thread pool."""
+    """Run a sync function in the inference thread pool.
+
+    Vision framework (face detect, OCR) and ONNX Runtime (face embed) are
+    thread-safe and run freely in parallel. MLX (CLIP) is NOT thread-safe
+    and is serialized by MLXClip._inference_lock inside clip.py.
+    """
     return asyncio.get_running_loop().run_in_executor(_inference_pool, fn, *args)
 
 
