@@ -52,7 +52,7 @@ def _detect_faces_impl(
 ) -> tuple[list[dict], int, int]:
     """Internal face detection implementation (assumes autorelease pool is active)."""
     try:
-        from src.main import metal_lock
+        from src.gpu_lock import metal_lock
 
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)

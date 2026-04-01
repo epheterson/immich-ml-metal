@@ -157,18 +157,6 @@ _inference_pool = ThreadPoolExecutor(
 
 
 
-# Global Metal GPU lock. MLX is not thread-safe (ml-explore/mlx#3078)
-# and Vision framework also touches Metal internally for some requests.
-# Concurrent Metal access from different frameworks crashes the process.
-# ONNX Runtime with CPU/CoreML provider is safe without this lock.
-#
-# This lock serializes GPU-touching work (CLIP via MLX, face detect and
-# OCR via Vision) while face embedding (ONNX/CPU) runs freely in parallel.
-# The lock is acquired inside the model code, not here — keeping
-# preprocessing and I/O outside the critical section.
-metal_lock = _threading.Lock()
-
-
 def _run_in_pool(fn, *args):
     """Run a sync function in the inference thread pool."""
     return asyncio.get_running_loop().run_in_executor(_inference_pool, fn, *args)
