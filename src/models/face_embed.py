@@ -140,7 +140,7 @@ def _load_model(model_name: str):
     try:
         import onnxruntime as ort
         from insightface.model_zoo import model_zoo
-        from insightface.utils import ensure_available
+        from insightface.utils.storage import download as download_model_pack
     except ImportError as e:
         logger.error(f"Failed to import required packages: {e}")
         raise RuntimeError(
@@ -157,28 +157,8 @@ def _load_model(model_name: str):
     else:
         providers = ["CPUExecutionProvider"]
         logger.info("Using CPU for face recognition (CoreML not available)")
-    
-    # Download model pack if needed
-    model_dir = Path.home() / ".insightface" / "models" / model_name
-    if not model_dir.exists():
-        logger.info(f"Downloading {model_name} model pack (first run)")
-        try:
-            ensure_available("models", model_name, root=str(Path.home() / ".insightface"))
-        except Exception as e:
-            logger.error(f"Failed to download model pack: {e}", exc_info=True)
-            raise RuntimeError(f"Could not download {model_name} model pack") from e
-    
-    # Find the recognition model using robust detection
-    rec_model_path = _find_recognition_model(model_dir)
-    
-    if rec_model_path is None:
-        available_files = [f.name for f in model_dir.glob("*.onnx")]
-        logger.error(f"No valid recognition model found in {model_dir}")
-        logger.error(f"Available ONNX files: {available_files}")
-        raise FileNotFoundError(
-            f"No ArcFace recognition model (input: 3x112x112, output: 512-dim) "
-            f"found in {model_dir}"
-        )
+
+    rec_model_path = _ensure_recognition_model_pack(model_name, download_model_pack)
     
     logger.info(f"Loading recognition model: {rec_model_path.name}")
     
@@ -188,6 +168,49 @@ def _load_model(model_name: str):
     except Exception as e:
         logger.error(f"Failed to load recognition model: {e}", exc_info=True)
         raise RuntimeError(f"Could not load {model_name} recognition model") from e
+
+
+def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path:
+    """
+    Ensure the face model pack exists and contains a valid ArcFace model.
+
+    If the cached pack is missing or does not contain a usable ArcFace model,
+    refresh it once from the upstream InsightFace release.
+    """
+    insightface_root = Path.home() / ".insightface"
+    model_dir = insightface_root / "models" / model_name
+
+    rec_model_path = _find_recognition_model(model_dir) if model_dir.exists() else None
+    if rec_model_path is not None:
+        return rec_model_path
+
+    if model_dir.exists():
+        logger.warning(
+            "No valid recognition model found in cached pack %s; refreshing download",
+            model_dir,
+        )
+        force = True
+    else:
+        logger.info(f"Downloading {model_name} model pack")
+        force = False
+
+    try:
+        download_model_pack("models", model_name, force=force, root=str(insightface_root))
+    except Exception as e:
+        logger.error(f"Failed to download model pack: {e}", exc_info=True)
+        raise RuntimeError(f"Could not download {model_name} model pack") from e
+
+    rec_model_path = _find_recognition_model(model_dir)
+    if rec_model_path is not None:
+        return rec_model_path
+
+    available_files = [f.name for f in model_dir.glob("*.onnx")] if model_dir.exists() else []
+    logger.error(f"No valid recognition model found in {model_dir}")
+    logger.error(f"Available ONNX files: {available_files}")
+    raise FileNotFoundError(
+        f"No ArcFace recognition model (input: 3x112x112, output: 512-dim) "
+        f"found in {model_dir}"
+    )
 
 
 def unload_recognition_model():
