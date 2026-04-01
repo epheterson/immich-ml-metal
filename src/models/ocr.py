@@ -68,18 +68,21 @@ def _recognize_text_impl(
 ) -> dict:
     """Internal OCR implementation (assumes autorelease pool is active)."""
     try:
+        from src.main import metal_lock
+
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
         request = Vision.VNRecognizeTextRequest.alloc().init()
-        
+
         if recognition_level == "fast":
             request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelFast)
         else:
             request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-        
+
         request.setUsesLanguageCorrection_(use_language_correction)
-        
-        success, error = handler.performRequests_error_([request], None)
+
+        with metal_lock:
+            success, error = handler.performRequests_error_([request], None)
         
         if not success or error:
             logger.error(f"Vision OCR error: {error}")

@@ -46,17 +46,20 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
 
 
 def _detect_faces_impl(
-    image_bytes: bytes, 
-    img_width: int, 
+    image_bytes: bytes,
+    img_width: int,
     img_height: int
 ) -> tuple[list[dict], int, int]:
     """Internal face detection implementation (assumes autorelease pool is active)."""
     try:
+        from src.main import metal_lock
+
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
         request = Vision.VNDetectFaceLandmarksRequest.alloc().init()
-        
-        success, error = handler.performRequests_error_([request], None)
+
+        with metal_lock:
+            success, error = handler.performRequests_error_([request], None)
         
         if not success or error:
             logger.error(f"Vision framework error: {error}")

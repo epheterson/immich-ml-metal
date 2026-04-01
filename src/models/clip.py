@@ -59,7 +59,10 @@ class MLXClip:
         self._tokenizer = None
         self._loaded = False
         self._repo_id = MODEL_MAP.get(model_name, MODEL_MAP.get("default"))
-        self._inference_lock = threading.Lock()
+        # Use the global metal_lock — Vision framework also touches Metal
+        # and concurrent MLX + Vision Metal access crashes the process.
+        from src.main import metal_lock
+        self._inference_lock = metal_lock
         self._load_model()
     
     def _load_model(self):
