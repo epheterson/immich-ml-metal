@@ -151,7 +151,9 @@ def _start_idle_monitor() -> None:
 
 # Dedicated thread pool for ML inference — reuses threads instead of
 # creating a new one per asyncio.to_thread() call.
-_inference_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ml-inference")
+_inference_pool = ThreadPoolExecutor(
+    max_workers=settings.max_concurrent_requests, thread_name_prefix="ml-inference"
+)
 
 
 def _run_in_pool(fn, *args):
@@ -625,17 +627,14 @@ async def _process_predict(
             coroutines.append(_timed("ocr", _run_ocr(task_config)))
 
     # Run all tasks concurrently — they hit independent compute units.
-    # return_exceptions=True so one failure doesn't cancel the others
-    # (matches the old sequential behaviour where each task was independent).
+    # Exceptions propagate: if any task fails the whole request fails,
+    # matching the old sequential behaviour.
     t_start = _time.monotonic()
-    results = await asyncio.gather(*coroutines, return_exceptions=True)
+    results = await asyncio.gather(*coroutines)
     total_ms = (_time.monotonic() - t_start) * 1000
 
     task_names = [t for t in tasks.keys() if t in ("clip", "facial-recognition", "ocr")]
     for result in results:
-        if isinstance(result, BaseException):
-            logger.error("Task failed during concurrent execution: %s", result)
-            continue
         if result is not None:
             key, value = result
             response[key] = value

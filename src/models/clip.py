@@ -151,7 +151,9 @@ class MLXClip:
         """
         Generate CLIP embedding for an image.
         Thread-safe — only GPU inference is serialized. Image decode and
-        preprocessing run outside the lock.
+        preprocessing run outside the lock. A reference to the model is
+        captured before preprocessing and verified after acquiring the lock
+        so a concurrent model switch cannot cause a mismatch.
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded")
@@ -163,11 +165,14 @@ class MLXClip:
             return self._encode_image_fallback(image)
 
         # MLX path — preprocess the PIL image directly (no temp file needed).
-        # mlx_clip's image_encoder opens a file path then calls img_processor;
-        # we skip the file I/O and call the processor ourselves.
-        processed = self._model.img_processor([image])
+        # Capture model reference before preprocessing so we can detect
+        # if the model was swapped between preprocessing and inference.
+        model_ref = self._model
+        processed = model_ref.img_processor([image])
 
         with self._inference_lock:
+            if self._model is not model_ref:
+                raise RuntimeError("CLIP model changed during preprocessing, retry")
             output = self._model.model(**{"pixel_values": processed})
             embedding = output.image_embeds[0]
 
@@ -180,16 +185,19 @@ class MLXClip:
         """Encode image using open_clip fallback.
 
         Preprocessing (resize/normalize) runs outside the lock since it's
-        CPU-only. Only the MPS/GPU inference is serialized.
+        CPU-only. Only the MPS/GPU inference is serialized. Model reference
+        is captured before preprocessing and verified after lock acquisition.
         """
         import torch
 
-        # Preprocess outside lock — self._processor is a stateless
-        # torchvision.transforms.Compose; model unload is blocked while busy.
+        # Capture model reference before preprocessing
+        model_ref = self._model
         image_tensor = self._processor(image).unsqueeze(0).to(self._device)
 
         # Only hold lock for GPU inference
         with self._inference_lock:
+            if self._model is not model_ref:
+                raise RuntimeError("CLIP model changed during preprocessing, retry")
             with torch.no_grad():
                 embedding = self._model.encode_image(image_tensor)
                 embedding = embedding / embedding.norm(dim=-1, keepdim=True)
@@ -219,14 +227,18 @@ class MLXClip:
 
         Tokenization runs outside the lock since it's CPU-only.
         Only the MPS/GPU inference is serialized, matching _encode_image_fallback.
+        Model reference is captured before tokenization and verified after lock.
         """
         import torch
 
-        # Tokenize outside lock — CPU-only work
+        # Capture model reference before tokenization
+        model_ref = self._model
         tokens = self._tokenizer([text]).to(self._device)
 
         # Only hold lock for GPU inference
         with self._inference_lock:
+            if self._model is not model_ref:
+                raise RuntimeError("CLIP model changed during preprocessing, retry")
             with torch.no_grad():
                 embedding = self._model.encode_text(tokens)
                 embedding = embedding / embedding.norm(dim=-1, keepdim=True)

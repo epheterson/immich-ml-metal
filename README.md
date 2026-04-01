@@ -103,7 +103,6 @@ Configure via environment variables or edit `src/config.py`:
 | `ML_PORT` | `3003` | Port number (must match Immich config) |
 | `ML_MODELS_DIR` | `./models` | Model storage directory |
 | `ML_CLIP_MODEL` | `ViT-B-32__openai` | CLIP model name |
-| `ML_CLIP_BUFFER_RAM_MB` | `256` | Max RAM for image encode queue (MB) |
 | `ML_FACE_MODEL` | `buffalo_l` | Face recognition model (buffalo_s/m/l) |
 | `ML_FACE_MIN_SCORE` | `0.7` | Face detection confidence threshold |
 | `ML_OCR_LANGUAGE_CORRECTION` | `true` | Language correction for OCR (disable for codes/serials) |
