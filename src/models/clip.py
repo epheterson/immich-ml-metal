@@ -59,7 +59,10 @@ class MLXClip:
         self._tokenizer = None
         self._loaded = False
         self._repo_id = MODEL_MAP.get(model_name, MODEL_MAP.get("default"))
-        self._inference_lock = threading.Lock()
+        # Use the global metal_lock — Vision framework also touches Metal
+        # and concurrent MLX + Vision Metal access crashes the process.
+        from src.gpu_lock import metal_lock
+        self._inference_lock = metal_lock
         self._load_model()
     
     def _load_model(self):
@@ -175,9 +178,12 @@ class MLXClip:
                 raise RuntimeError("CLIP model changed during preprocessing, retry")
             output = self._model.model(**{"pixel_values": processed})
             embedding = output.image_embeds[0]
+            # Force Metal evaluation inside the lock — MLX arrays are lazy,
+            # and Metal work must complete before releasing the lock so
+            # Vision framework calls don't collide with in-flight Metal ops.
+            if isinstance(embedding, mx.array):
+                embedding = np.array(embedding)
 
-        if isinstance(embedding, mx.array):
-            embedding = np.array(embedding)
         embedding = embedding / np.linalg.norm(embedding)
         return embedding.flatten().astype(np.float32)
     

@@ -156,6 +156,7 @@ _inference_pool = ThreadPoolExecutor(
 )
 
 
+
 def _run_in_pool(fn, *args):
     """Run a sync function in the inference thread pool."""
     return asyncio.get_running_loop().run_in_executor(_inference_pool, fn, *args)
