@@ -20,8 +20,6 @@ mlx>=0.22.0
 huggingface-hub>=0.20.0
 
 # Pin mlx-clip to specific commit for stability
-# To find current commit: git ls-remote https://github.com/harperreed/mlx_clip.git HEAD
-# TODO: Replace COMMIT_HASH with actual commit hash before deploying
 mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c
 
 # Fallback if you want to use open_clip instead of mlx-clip:
