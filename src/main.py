@@ -5,7 +5,7 @@ Drop-in replacement for Immich's ML service, optimized for Apple Silicon.
 """
 
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
-from fastapi.responses import ORJSONResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from typing import Optional
 from functools import partial
 import json
@@ -64,6 +64,7 @@ def _available_memory_mb() -> int:
     try:
         import subprocess
         import re
+
         vm = subprocess.check_output(["vm_stat"], timeout=5).decode()
         ps_match = re.search(r"page size of (\d+) bytes", vm)
         page_size = int(ps_match.group(1)) if ps_match else 16384
@@ -105,6 +106,7 @@ def _unload_model(model_type: str, reason: str) -> None:
     try:
         if model_type == "clip":
             from .models import clip as clip_module
+
             with clip_module._model_lock:
                 if clip_module._current_model is not None:
                     clip_module._current_model.unload()
@@ -114,6 +116,7 @@ def _unload_model(model_type: str, reason: str) -> None:
             _model_last_used.pop("clip", None)
         elif model_type == "face":
             from .models import face_embed as face_module
+
             if face_module._recognition_model is not None:
                 face_module.unload_recognition_model()
                 logger.info("Unloaded face model (%s)", reason)
@@ -141,7 +144,9 @@ def _start_idle_monitor() -> None:
                         reason = "idle %.0fs" % idle_sec
                     else:
                         reason = "memory pressure, %dMB available, idle %.0fs" % (
-                            avail_mb, idle_sec)
+                            avail_mb,
+                            idle_sec,
+                        )
                     _unload_model(model_type, reason)
 
     t = _threading.Thread(target=_monitor, daemon=True, name="model-memory-monitor")
@@ -154,7 +159,6 @@ def _start_idle_monitor() -> None:
 _inference_pool = ThreadPoolExecutor(
     max_workers=settings.max_concurrent_requests, thread_name_prefix="ml-inference"
 )
-
 
 
 def _run_in_pool(fn, *args):
@@ -202,7 +206,9 @@ class PredictResponse(BaseModel):
     imageHeight: Optional[int] = None
     imageWidth: Optional[int] = None
     clip: Optional[str] = None  # Stringified array
-    facial_recognition: Optional[list[FaceDetection]] = Field(None, alias="facial-recognition")
+    facial_recognition: Optional[list[FaceDetection]] = Field(
+        None, alias="facial-recognition"
+    )
     ocr: Optional[OCRResult] = None
 
 
@@ -218,7 +224,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Face min score: {settings.face_min_score}")
     logger.info(f"Max concurrent requests: {settings.max_concurrent_requests}")
     logger.info(f"Log level: {settings.log_level}")
-    
+
     _start_idle_monitor()
     yield
 
@@ -228,17 +234,17 @@ async def lifespan(app: FastAPI):
         try:
             from .models import clip as clip_module
             from .models import face_embed as face_module
-            
+
             # Cleanup CLIP model
             with clip_module._model_lock:
                 if clip_module._current_model is not None:
                     clip_module._current_model.unload()
                     clip_module._current_model = None
                     clip_module._current_model_name = None
-            
+
             # Cleanup face recognition model
             face_module.unload_recognition_model()
-            
+
             logger.info("Models unloaded successfully")
         except Exception as e:
             logger.error(f"Error during model cleanup: {e}")
@@ -250,7 +256,7 @@ app = FastAPI(
     title="immich-ml-metal",
     description="Metal/ANE-optimized drop-in replacement for Immich ML",
     version="0.1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
@@ -274,6 +280,7 @@ def get_clip(model_name: str = "ViT-B-32__openai"):
     if STUB_MODE:
         return None
     from .models.clip import get_clip_model
+
     _mark_model_busy("clip")
     try:
         return get_clip_model(model_name)
@@ -283,23 +290,16 @@ def get_clip(model_name: str = "ViT-B-32__openai"):
 
 
 async def run_face_recognition_async(
-    image_bytes: bytes, 
-    min_score: float, 
-    model_name: str
+    image_bytes: bytes, min_score: float, model_name: str
 ) -> list[dict]:
     """Run face detection and embedding generation (async wrapper)."""
     return await _run_in_pool(
-        _run_face_recognition_sync,
-        image_bytes,
-        min_score,
-        model_name
+        _run_face_recognition_sync, image_bytes, min_score, model_name
     )
 
 
 def _run_face_recognition_sync(
-    image_bytes: bytes,
-    min_score: float,
-    model_name: str
+    image_bytes: bytes, min_score: float, model_name: str
 ) -> list[dict]:
     """Synchronous face recognition implementation.
 
@@ -309,6 +309,7 @@ def _run_face_recognition_sync(
     import cv2
     from .models.face_detect import detect_faces
     from .models.face_embed import get_face_embeddings_batch
+
     _mark_model_busy("face")
 
     try:
@@ -333,11 +334,13 @@ def _run_face_recognition_sync(
         results = []
         for face, embedding in zip(scored_faces, embeddings):
             if embedding is not None:
-                results.append({
-                    "boundingBox": face["boundingBox"],
-                    "embedding": str(embedding.tolist()),
-                    "score": face["score"]
-                })
+                results.append(
+                    {
+                        "boundingBox": face["boundingBox"],
+                        "embedding": str(embedding.tolist()),
+                        "score": face["score"],
+                    }
+                )
 
         return results
     finally:
@@ -347,7 +350,7 @@ def _run_face_recognition_sync(
 @app.get("/")
 async def root():
     """Root endpoint - mirrors Immich ML."""
-    return ORJSONResponse({"message": "Immich ML"})
+    return JSONResponse({"message": "Immich ML"})
 
 
 @app.get("/ping")
@@ -360,15 +363,11 @@ def ping():
 async def health():
     """
     Detailed health check endpoint.
-    
+
     Checks if models can be loaded and basic functionality works.
     """
-    health_status = {
-        "status": "healthy",
-        "stub_mode": STUB_MODE,
-        "checks": {}
-    }
-    
+    health_status = {"status": "healthy", "stub_mode": STUB_MODE, "checks": {}}
+
     try:
         if not STUB_MODE:
             # Check CLIP model
@@ -380,20 +379,22 @@ async def health():
                 logger.error(f"CLIP health check failed: {e}")
                 health_status["checks"]["clip"] = f"error: {str(e)}"
                 health_status["status"] = "degraded"
-            
+
             # Check face recognition model
             try:
                 from .models.face_embed import get_recognition_model
+
                 get_recognition_model(settings.face_model)
                 health_status["checks"]["face_recognition"] = "ok"
             except Exception as e:
                 logger.error(f"Face recognition health check failed: {e}")
                 health_status["checks"]["face_recognition"] = f"error: {str(e)}"
                 health_status["status"] = "degraded"
-            
+
             # Actually test Vision framework with a minimal image
             try:
                 from .models.face_detect import detect_faces
+
                 # Create 1x1 test image
                 test_img = Image.new("RGB", (1, 1), color=(128, 128, 128))
                 buffer = io.BytesIO()
@@ -406,14 +407,13 @@ async def health():
                 health_status["status"] = "degraded"
         else:
             health_status["checks"]["stub_mode"] = "active"
-        
+
         return JSONResponse(content=health_status)
-        
+
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
         return JSONResponse(
-            content={"status": "unhealthy", "error": str(e)},
-            status_code=503
+            content={"status": "unhealthy", "error": str(e)}, status_code=503
         )
 
 
@@ -425,14 +425,14 @@ async def predict(
 ):
     """
     Main prediction endpoint - mirrors Immich ML API.
-    
+
     Args:
         entries: JSON string describing requested tasks
         image: Optional image file for visual tasks
         text: Optional text for text encoding tasks
-    
+
     Returns:
-        ORJSONResponse with inference results
+        JSONResponse with inference results
     """
     # Apply backpressure via semaphore
     semaphore = get_request_semaphore()
@@ -444,7 +444,7 @@ async def predict(
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=503,
-            detail="Service overloaded, request timed out waiting in queue"
+            detail="Service overloaded, request timed out waiting in queue",
         )
 
 
@@ -452,7 +452,7 @@ async def _process_predict(
     entries: str,
     image: Optional[UploadFile],
     text: Optional[str],
-) -> ORJSONResponse:
+) -> JSONResponse:
     """Internal predict processing (assumes semaphore is held)."""
     # Parse the entries JSON
     try:
@@ -460,15 +460,14 @@ async def _process_predict(
     except json.JSONDecodeError as e:
         logger.error(f"Invalid entries JSON: {e}")
         raise HTTPException(status_code=422, detail=f"Invalid entries JSON: {e}")
-    
+
     if image is None and text is None:
         raise HTTPException(
-            status_code=400, 
-            detail="Either image or text must be provided"
+            status_code=400, detail="Either image or text must be provided"
         )
-    
+
     response = {}
-    
+
     # Read and validate image if provided
     image_bytes = None
     img = None
@@ -476,27 +475,24 @@ async def _process_predict(
         if image.size and image.size > settings.max_image_size:
             raise HTTPException(
                 status_code=413,
-                detail=f"Image too large. Max size: {settings.max_image_size / 1024 / 1024:.1f}MB"
+                detail=f"Image too large. Max size: {settings.max_image_size / 1024 / 1024:.1f}MB",
             )
-        
+
         try:
             image_bytes = await image.read()
             img = Image.open(io.BytesIO(image_bytes))
             response["imageHeight"] = img.height
             response["imageWidth"] = img.width
-            
+
             if img.width * img.height > 100_000_000:  # 100 megapixels
-                raise HTTPException(
-                    status_code=413,
-                    detail="Image resolution too high"
-                )
-                
+                raise HTTPException(status_code=413, detail="Image resolution too high")
+
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Failed to read/decode image: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-    
+
     # Build concurrent coroutines for each requested task.
     # CLIP hits GPU/Metal, face detection hits ANE (Vision), face embedding hits
     # CPU/CoreML (ONNX), and OCR hits ANE (Vision). Face detection and OCR share
@@ -524,10 +520,7 @@ async def _process_predict(
             else:
                 clip = get_clip(model_name)
                 try:
-                    embedding = await _run_in_pool(
-                        clip.encode_image,
-                        image_bytes
-                    )
+                    embedding = await _run_in_pool(clip.encode_image, image_bytes)
                 finally:
                     _track_model_use("clip")
 
@@ -542,10 +535,7 @@ async def _process_predict(
             else:
                 clip = get_clip(model_name)
                 try:
-                    embedding = await _run_in_pool(
-                        clip.encode_text,
-                        text
-                    )
+                    embedding = await _run_in_pool(clip.encode_text, text)
                 finally:
                     _track_model_use("clip")
 
@@ -562,8 +552,7 @@ async def _process_predict(
         recognition_config = task_config.get("recognition", {})
 
         min_score = detection_config.get("options", {}).get(
-            "minScore",
-            settings.face_min_score
+            "minScore", settings.face_min_score
         )
         model_name = recognition_config.get("modelName", settings.face_model)
 
@@ -575,18 +564,14 @@ async def _process_predict(
                         "x1": int(img.width * 0.25),
                         "y1": int(img.height * 0.15),
                         "x2": int(img.width * 0.75),
-                        "y2": int(img.height * 0.85)
+                        "y2": int(img.height * 0.85),
                     },
                     "embedding": str(fake_embedding),
-                    "score": 0.99
+                    "score": 0.99,
                 }
             ]
         else:
-            faces = await run_face_recognition_async(
-                image_bytes,
-                min_score,
-                model_name
-            )
+            faces = await run_face_recognition_async(image_bytes, min_score, model_name)
 
         logger.info("  faces: %d detected", len(faces))
         return ("facial-recognition", faces)
@@ -600,22 +585,48 @@ async def _process_predict(
         recognition_config = task_config.get("recognition", {})
 
         min_detection_score = detection_config.get("options", {}).get("minScore", 0.0)
-        min_recognition_score = recognition_config.get("options", {}).get("minScore", 0.0)
+        min_recognition_score = recognition_config.get("options", {}).get(
+            "minScore", 0.0
+        )
         min_score = max(min_detection_score, min_recognition_score)
 
         if STUB_MODE:
-            return ("ocr", {
-                "text": ["placeholder", "text"],
-                "box": [0, 0, 100, 0, 100, 50, 0, 50, 0, 50, 100, 50, 100, 100, 0, 100],
-                "boxScore": [0.95, 0.92],
-                "textScore": [0.98, 0.96]
-            })
+            return (
+                "ocr",
+                {
+                    "text": ["placeholder", "text"],
+                    "box": [
+                        0,
+                        0,
+                        100,
+                        0,
+                        100,
+                        50,
+                        0,
+                        50,
+                        0,
+                        50,
+                        100,
+                        50,
+                        100,
+                        100,
+                        0,
+                        100,
+                    ],
+                    "boxScore": [0.95, 0.92],
+                    "textScore": [0.98, 0.96],
+                },
+            )
         else:
             from .models.ocr import recognize_text
+
             ocr_result = await _run_in_pool(
-                partial(recognize_text, image_bytes,
-                        min_confidence=min_score,
-                        use_language_correction=settings.ocr_use_language_correction)
+                partial(
+                    recognize_text,
+                    image_bytes,
+                    min_confidence=min_score,
+                    use_language_correction=settings.ocr_use_language_correction,
+                )
             )
             return ("ocr", ocr_result)
 
@@ -640,18 +651,23 @@ async def _process_predict(
             key, value = result
             response[key] = value
 
-    logger.info("predict: %d task(s) [%s] completed in %.0fms",
-                len(task_names), "+".join(task_names), total_ms)
+    logger.info(
+        "predict: %d task(s) [%s] completed in %.0fms",
+        len(task_names),
+        "+".join(task_names),
+        total_ms,
+    )
 
     # Validate response against schema - fail loudly if validation fails
     try:
         validated_response = PredictResponse(**response)
-        return ORJSONResponse(validated_response.model_dump(by_alias=True, exclude_none=True))
+        return JSONResponse(
+            validated_response.model_dump(by_alias=True, exclude_none=True)
+        )
     except Exception as e:
         logger.error(f"Response validation failed: {e}", exc_info=True)
         raise HTTPException(
-            status_code=500,
-            detail=f"Internal error: response validation failed"
+            status_code=500, detail=f"Internal error: response validation failed"
         )
 
 
@@ -659,22 +675,22 @@ async def _process_predict(
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler for unexpected errors."""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    
+
     # Only expose error details in debug mode (should be off for network-exposed service)
     error_detail = str(exc) if settings.debug_mode else "Internal server error"
-    
+
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error", "error": error_detail}
+        content={"detail": "Internal server error", "error": error_detail},
     )
 
 
 def main():
     """Entry point for running the service directly."""
     import uvicorn
-    
+
     logger.info(f"Starting server on {settings.host}:{settings.port}")
-    
+
     uvicorn.run(
         "src.main:app",
         host=settings.host,
