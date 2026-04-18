@@ -25,85 +25,86 @@ ARCFACE_EMBEDDING_DIM = 512
 _recognition_model = None
 _current_model_name: Optional[str] = None
 _model_lock = threading.Lock()
+# Non-reentrant. Serializes all ONNX inference calls (get_feat).
+# Do NOT call any get_face_* function while holding this lock —
+# the per-face fallback in get_face_embeddings_batch acquires it
+# once per face after releasing the batch-level acquisition.
 _inference_lock = threading.Lock()
 
 
 def get_recognition_model(model_name: str = "buffalo_l"):
     """
     Get or create the face recognition model (thread-safe).
-    
+
     Loads the recognition model directly from insightface model zoo.
     If a different model is requested, unloads the current one first.
-    
+
     Args:
         model_name: InsightFace model name (buffalo_s, buffalo_m, buffalo_l)
     """
     global _recognition_model, _current_model_name
-    
+
     with _model_lock:
         if _recognition_model is not None and _current_model_name != model_name:
             logger.info(f"Switching face model: {_current_model_name} -> {model_name}")
             unload_recognition_model()
-        
+
         if _recognition_model is None:
             logger.info(f"Loading face recognition model: {model_name}")
             _load_model(model_name)
             _current_model_name = model_name
-        
+
         return _recognition_model
 
 
 def _find_recognition_model(model_dir: Path) -> Optional[Path]:
     """
     Find the recognition model in a model pack directory.
-    
+
     Uses shape validation to identify ArcFace models rather than
     relying on filename patterns which may change between versions.
-    
+
     Returns:
         Path to the recognition model, or None if not found.
     """
     import onnxruntime as ort
-    
+
     onnx_files = list(model_dir.glob("*.onnx"))
     if not onnx_files:
         return None
-    
+
     # Known filename patterns (checked first for speed)
     known_patterns = ["w600k", "w300k", "glintr", "arcface"]
-    
+
     for f in onnx_files:
         if any(pattern in f.name.lower() for pattern in known_patterns):
             # Verify it's actually a recognition model by checking shapes
             if _validate_recognition_model(f):
                 return f
-    
+
     # Fallback: check all ONNX files for correct input/output shapes
     for f in onnx_files:
         if _validate_recognition_model(f):
             logger.info(f"Found recognition model by shape validation: {f.name}")
             return f
-    
+
     return None
 
 
 def _validate_recognition_model(model_path: Path) -> bool:
     """
     Validate that an ONNX model is an ArcFace recognition model.
-    
+
     Checks:
     - Input shape compatible with (batch, 3, 112, 112)
     - Output shape compatible with (batch, 512)
     """
     try:
         import onnxruntime as ort
-        
+
         # Quick session just to check metadata
-        sess = ort.InferenceSession(
-            str(model_path), 
-            providers=["CPUExecutionProvider"]
-        )
-        
+        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+
         # Check input shape
         input_info = sess.get_inputs()[0]
         input_shape = input_info.shape
@@ -116,7 +117,7 @@ def _validate_recognition_model(model_path: Path) -> bool:
         # Check channels (index 1)
         if input_shape[1] != 3:
             return False
-        
+
         # Check output shape
         output_info = sess.get_outputs()[0]
         output_shape = output_info.shape
@@ -125,9 +126,9 @@ def _validate_recognition_model(model_path: Path) -> bool:
         # Check embedding dimension (index 1)
         if output_shape[1] != ARCFACE_EMBEDDING_DIM:
             return False
-        
+
         return True
-        
+
     except Exception as e:
         logger.debug(f"Model validation failed for {model_path}: {e}")
         return False
@@ -136,7 +137,7 @@ def _validate_recognition_model(model_path: Path) -> bool:
 def _load_model(model_name: str):
     """Internal function to load the model (assumes lock is held)."""
     global _recognition_model
-    
+
     try:
         import onnxruntime as ort
         from insightface.model_zoo import model_zoo
@@ -147,10 +148,10 @@ def _load_model(model_name: str):
             "insightface or onnxruntime not available. "
             "Install with: pip install insightface onnxruntime"
         ) from e
-    
+
     available = ort.get_available_providers()
     logger.info(f"ONNX Runtime providers available: {available}")
-    
+
     if "CoreMLExecutionProvider" in available:
         providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         logger.info("Using CoreML for face recognition")
@@ -159,11 +160,13 @@ def _load_model(model_name: str):
         logger.info("Using CPU for face recognition (CoreML not available)")
 
     rec_model_path = _ensure_recognition_model_pack(model_name, download_model_pack)
-    
+
     logger.info(f"Loading recognition model: {rec_model_path.name}")
-    
+
     try:
-        _recognition_model = model_zoo.get_model(str(rec_model_path), providers=providers)
+        _recognition_model = model_zoo.get_model(
+            str(rec_model_path), providers=providers
+        )
         logger.info(f"Successfully loaded face recognition model: {model_name}")
     except Exception as e:
         logger.error(f"Failed to load recognition model: {e}", exc_info=True)
@@ -195,7 +198,9 @@ def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path
         force = False
 
     try:
-        download_model_pack("models", model_name, force=force, root=str(insightface_root))
+        download_model_pack(
+            "models", model_name, force=force, root=str(insightface_root)
+        )
     except Exception as e:
         logger.error(f"Failed to download model pack: {e}", exc_info=True)
         raise RuntimeError(f"Could not download {model_name} model pack") from e
@@ -204,7 +209,9 @@ def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path
     if rec_model_path is not None:
         return rec_model_path
 
-    available_files = [f.name for f in model_dir.glob("*.onnx")] if model_dir.exists() else []
+    available_files = (
+        [f.name for f in model_dir.glob("*.onnx")] if model_dir.exists() else []
+    )
     logger.error(f"No valid recognition model found in {model_dir}")
     logger.error(f"Available ONNX files: {available_files}")
     raise FileNotFoundError(
@@ -216,7 +223,7 @@ def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path
 def unload_recognition_model():
     """Unload the current recognition model and free memory."""
     global _recognition_model, _current_model_name
-    
+
     if _recognition_model is not None:
         logger.info(f"Unloading face recognition model: {_current_model_name}")
         _recognition_model = None
@@ -225,19 +232,17 @@ def unload_recognition_model():
 
 
 def get_face_embedding(
-    image_bytes: bytes,
-    landmarks: list[list[float]],
-    model_name: str = "buffalo_l"
+    image_bytes: bytes, landmarks: list[list[float]], model_name: str = "buffalo_l"
 ) -> np.ndarray:
     """
     Generate 512-dim face embedding using ArcFace (thread-safe).
-    
+
     Args:
         image_bytes: Raw image data
         landmarks: 5-point landmarks [[x,y], ...] from Vision framework
                   Order: left_eye, right_eye, nose, left_mouth, right_mouth
         model_name: InsightFace model to use
-        
+
     Returns:
         512-dimensional normalized embedding as float32 array
     """
@@ -246,7 +251,7 @@ def get_face_embedding(
     except ImportError as e:
         logger.error("insightface not available")
         raise RuntimeError("Install insightface: pip install insightface") from e
-    
+
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -255,34 +260,32 @@ def get_face_embedding(
     except Exception as e:
         logger.error(f"Image decoding failed: {e}")
         raise
-    
+
     kps = np.array(landmarks, dtype=np.float32)
-    
+
     try:
         aligned_face = face_align.norm_crop(img_bgr, kps, image_size=ARCFACE_INPUT_SIZE)
     except Exception as e:
         logger.error(f"Face alignment failed: {e}")
         raise
-    
+
     model = get_recognition_model(model_name)
-    
+
     with _inference_lock:
         try:
             embedding = model.get_feat(aligned_face)
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
             raise
-    
+
     embedding = embedding.flatten()
     embedding = embedding / np.linalg.norm(embedding)
-    
+
     return embedding.astype(np.float32)
 
 
 def get_face_embeddings_batch(
-    img_bgr: np.ndarray,
-    faces: list[dict],
-    model_name: str = "buffalo_l"
+    img_bgr: np.ndarray, faces: list[dict], model_name: str = "buffalo_l"
 ) -> list[Optional[np.ndarray]]:
     """
     Generate embeddings for multiple faces in a single batched ONNX inference.
@@ -337,7 +340,9 @@ def get_face_embeddings_batch(
                     cv2.resize(crop, (ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE))
                 )
         except Exception as e:
-            logger.warning("Face alignment failed for face %s: %s", face.get("boundingBox"), e)
+            logger.warning(
+                "Face alignment failed for face %s: %s", face.get("boundingBox"), e
+            )
             aligned.append(None)
 
     # Collect indices that actually produced an aligned image
@@ -356,16 +361,63 @@ def get_face_embeddings_batch(
         try:
             raw_embeddings = model.get_feat(batch)
         except Exception as e:
-            logger.error("Batched embedding inference failed: %s", e)
-            return [None] * len(faces)
+            # Batch inference can fail if the ONNX model has a fixed
+            # batch dimension (some buffalo_l exports ship this way).
+            # Fall back to per-face inference so group photos don't
+            # silently return zero embeddings.
+            logger.warning("Batched inference failed (%s), falling back to per-face", e)
+            raw_embeddings = None
+
+    if raw_embeddings is None:
+        # Per-face fallback — slower but works with any batch dim
+        results: list[Optional[np.ndarray]] = [None] * len(faces)
+        for batch_idx, face_idx in enumerate(valid_indices):
+            with _inference_lock:
+                try:
+                    single = model.get_feat([batch[batch_idx]])
+                    emb = single.flatten().astype(np.float32)
+                    norm = np.linalg.norm(emb)
+                    if norm > 0:
+                        emb = emb / norm
+                    results[face_idx] = emb
+                except Exception as e2:
+                    logger.warning(
+                        "Per-face embedding failed for face %d: %s", face_idx, e2
+                    )
+        return results
 
     # raw_embeddings shape: (N, 512) — normalise each row
     if raw_embeddings.ndim == 1:
         # Single face came back flat
         raw_embeddings = raw_embeddings.reshape(1, -1)
 
+    # Verify batch dimension matches expectations. If the model
+    # returned fewer rows than we sent (fixed-batch export returning
+    # only the first face), fall back to per-face.
+    if raw_embeddings.shape[0] != len(valid_indices):
+        logger.warning(
+            "Batch dim mismatch: sent %d faces, got %d rows — falling back to per-face",
+            len(valid_indices),
+            raw_embeddings.shape[0],
+        )
+        results = [None] * len(faces)
+        for batch_idx, face_idx in enumerate(valid_indices):
+            with _inference_lock:
+                try:
+                    single = model.get_feat([batch[batch_idx]])
+                    emb = single.flatten().astype(np.float32)
+                    norm = np.linalg.norm(emb)
+                    if norm > 0:
+                        emb = emb / norm
+                    results[face_idx] = emb
+                except Exception as e2:
+                    logger.warning(
+                        "Per-face embedding failed for face %d: %s", face_idx, e2
+                    )
+        return results
+
     # --- Map results back to input order ---
-    results: list[Optional[np.ndarray]] = [None] * len(faces)
+    results = [None] * len(faces)
     for batch_idx, face_idx in enumerate(valid_indices):
         emb = raw_embeddings[batch_idx].flatten().astype(np.float32)
         norm = np.linalg.norm(emb)
@@ -377,20 +429,18 @@ def get_face_embeddings_batch(
 
 
 def get_face_embedding_from_bbox(
-    image_bytes: bytes,
-    bbox: dict,
-    model_name: str = "buffalo_l"
+    image_bytes: bytes, bbox: dict, model_name: str = "buffalo_l"
 ) -> Optional[np.ndarray]:
     """
     Generate face embedding using bounding box (fallback, thread-safe).
-    
+
     Less accurate than landmark-based alignment but works as fallback.
-    
+
     Args:
         image_bytes: Raw image data
         bbox: Bounding box dict with x1, y1, x2, y2
         model_name: InsightFace model to use
-        
+
     Returns:
         512-dimensional normalized embedding, or None if failed
     """
@@ -400,37 +450,37 @@ def get_face_embedding_from_bbox(
         if img_bgr is None:
             logger.error("Failed to decode image")
             return None
-        
+
         x1, y1 = int(bbox["x1"]), int(bbox["y1"])
         x2, y2 = int(bbox["x2"]), int(bbox["y2"])
-        
+
         # Add 10% padding
         w, h = x2 - x1, y2 - y1
         pad_x, pad_y = int(w * 0.1), int(h * 0.1)
-        
+
         x1 = max(0, x1 - pad_x)
         y1 = max(0, y1 - pad_y)
         x2 = min(img_bgr.shape[1], x2 + pad_x)
         y2 = min(img_bgr.shape[0], y2 + pad_y)
-        
+
         face_crop = img_bgr[y1:y2, x1:x2]
-        
+
         if face_crop.size == 0:
             logger.error("Empty face crop")
             return None
-        
+
         face_resized = cv2.resize(face_crop, (ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE))
-        
+
         model = get_recognition_model(model_name)
-        
+
         with _inference_lock:
             embedding = model.get_feat(face_resized)
-        
+
         embedding = embedding.flatten()
         embedding = embedding / np.linalg.norm(embedding)
-        
+
         return embedding.astype(np.float32)
-        
+
     except Exception as e:
         logger.error(f"Embedding from bbox failed: {e}", exc_info=True)
         return None
@@ -444,39 +494,45 @@ def get_face_recognizer(model_name: str = "buffalo_l"):
 
 if __name__ == "__main__":
     import sys
-    
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
     logger.info("Testing face embedding generation...")
     logger.info("(This will download the model on first run)")
-    
+
     model = get_recognition_model("buffalo_l")
     logger.info(f"Model loaded successfully: {type(model).__name__}")
-    
+
     if len(sys.argv) > 1:
         from .face_detect import detect_faces
-        
+
         with open(sys.argv[1], "rb") as f:
             image_bytes = f.read()
-        
+
         faces, w, h = detect_faces(image_bytes)
         logger.info(f"Detected {len(faces)} face(s) in {w}x{h} image")
-        
+
         for i, face in enumerate(faces):
             logger.info(f"\nFace {i + 1}:")
-            logger.info(f"  BBox: ({face['boundingBox']['x1']:.0f}, {face['boundingBox']['y1']:.0f}) - "
-                       f"({face['boundingBox']['x2']:.0f}, {face['boundingBox']['y2']:.0f})")
+            logger.info(
+                f"  BBox: ({face['boundingBox']['x1']:.0f}, {face['boundingBox']['y1']:.0f}) - "
+                f"({face['boundingBox']['x2']:.0f}, {face['boundingBox']['y2']:.0f})"
+            )
             logger.info(f"  Score: {face['score']:.3f}")
-            
+
             if "landmarks" in face:
-                embedding = get_face_embedding(image_bytes, face["landmarks"], "buffalo_l")
+                embedding = get_face_embedding(
+                    image_bytes, face["landmarks"], "buffalo_l"
+                )
                 logger.info(f"  Embedding (landmark-aligned): {embedding.shape}")
             else:
-                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], "buffalo_l")
+                embedding = get_face_embedding_from_bbox(
+                    image_bytes, face["boundingBox"], "buffalo_l"
+                )
                 logger.info(f"  Embedding (bbox-cropped): {embedding.shape}")
-            
+
             if embedding is not None:
                 logger.info(f"  Embedding norm: {np.linalg.norm(embedding):.4f}")
                 logger.info(f"  First 5 values: {embedding[:5]}")
-    
+
     logger.info("\n✅ Face embedding test complete!")
