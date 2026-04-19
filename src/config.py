@@ -25,10 +25,6 @@ class Settings:
     clip_model: str = "ViT-B-32__openai"
     clip_model_path: Path = field(default_factory=lambda: Path("./models/clip-vit-base-patch32-mlx"))
     
-    # CLIP image buffer settings
-    # Images are buffered in RAM before encoding; overflow to disk if limit exceeded
-    clip_buffer_ram_limit_mb: int = 256  # Max MB to buffer in RAM for encode queue
-    
     # Face recognition settings
     # buffalo_l is Immich's default, provides best accuracy
     # buffalo_s and buffalo_m are smaller alternatives
@@ -76,7 +72,6 @@ class Settings:
             models_dir=Path(os.getenv("ML_MODELS_DIR", "./models")),
             cache_dir=Path(os.getenv("ML_CACHE_DIR", "./cache")),
             clip_model=os.getenv("ML_CLIP_MODEL", "ViT-B-32__openai"),
-            clip_buffer_ram_limit_mb=int(os.getenv("ML_CLIP_BUFFER_RAM_MB", "256")),
             face_model=os.getenv("ML_FACE_MODEL", "buffalo_l"),
             face_min_score=float(os.getenv("ML_FACE_MIN_SCORE", "0.7")),
             ocr_use_language_correction=os.getenv("ML_OCR_LANGUAGE_CORRECTION", "true").lower() == "true",

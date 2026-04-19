@@ -71,14 +71,16 @@ def _recognize_text_impl(
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
         request = Vision.VNRecognizeTextRequest.alloc().init()
-        
+
         if recognition_level == "fast":
             request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelFast)
         else:
             request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-        
+
         request.setUsesLanguageCorrection_(use_language_correction)
-        
+
+        # Vision framework is thread-safe with separate handlers.
+        # No gpu_lock needed — can overlap with CLIP and face detection.
         success, error = handler.performRequests_error_([request], None)
         
         if not success or error:

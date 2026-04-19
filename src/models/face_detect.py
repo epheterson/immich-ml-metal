@@ -46,8 +46,8 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
 
 
 def _detect_faces_impl(
-    image_bytes: bytes, 
-    img_width: int, 
+    image_bytes: bytes,
+    img_width: int,
     img_height: int
 ) -> tuple[list[dict], int, int]:
     """Internal face detection implementation (assumes autorelease pool is active)."""
@@ -55,7 +55,10 @@ def _detect_faces_impl(
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
         request = Vision.VNDetectFaceLandmarksRequest.alloc().init()
-        
+
+        # Vision framework is thread-safe with separate handlers per call.
+        # Can overlap with CLIP (MLX) as long as CLIP forces Metal eval
+        # inside its own lock. No gpu_lock needed here.
         success, error = handler.performRequests_error_([request], None)
         
         if not success or error:

@@ -9,7 +9,7 @@ Model implementations for immich-ml-metal.
 
 from .clip import get_clip_model, MLXClip
 from .face_detect import detect_faces
-from .face_embed import get_face_embedding, get_recognition_model
+from .face_embed import get_face_embedding, get_face_embeddings_batch, get_recognition_model
 from .ocr import recognize_text
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "MLXClip", 
     "detect_faces",
     "get_face_embedding",
+    "get_face_embeddings_batch",
     "get_recognition_model",
     "recognize_text",
 ]

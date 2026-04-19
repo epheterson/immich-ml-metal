@@ -15,7 +15,34 @@ Immich's standard ML container runs well on NVIDIA, Intel, and AMD GPUs. Recentl
 
 ## Performance: Why This is Fast
 
-This service uses Apple's MLX framework for CLIP. In my testing, this is significantly faster than alternatives (PyTorch or CPU-only). Due to Metal GPU limitations (AFAIK), inference requests are processed sequentially, but **total throughput is still pretty good**:
+Apple Silicon has three independent compute units — GPU (Metal), Neural Engine (ANE), and CPU. This service runs ML tasks across all three concurrently:
+
+| Task | Compute Unit | Framework |
+|------|-------------|-----------|
+| CLIP embedding | GPU (Metal) | MLX / open_clip MPS |
+| Face detection | ANE | Apple Vision |
+| Face embedding | CPU / CoreML | InsightFace ONNX |
+| OCR | ANE | Apple Vision |
+
+Within a single `/predict` request, CLIP, face recognition, and OCR run simultaneously via `asyncio.gather`. Face embeddings are batched into a single ONNX inference call regardless of how many faces are in the photo.
+
+**Benchmarks (M4, 24GB):**
+
+| Photo | Faces | Latency |
+|-------|-------|---------|
+| 3.5MB portrait | 0 | 134ms |
+| 5.5MB landscape | 0 | 149ms |
+| 26MB group photo | 3 | 602ms |
+| 23MB group photo | 5 | 589ms |
+
+Per-task timing is logged on every request:
+```
+INFO:   clip: 25ms
+INFO:   faces: 3 detected
+INFO:   faces: 135ms
+INFO:   ocr: 47ms
+INFO: predict: 3 task(s) [clip+facial-recognition+ocr] completed in 135ms
+```
 
 ## Project Status
 
@@ -76,7 +103,6 @@ Configure via environment variables or edit `src/config.py`:
 | `ML_PORT` | `3003` | Port number (must match Immich config) |
 | `ML_MODELS_DIR` | `./models` | Model storage directory |
 | `ML_CLIP_MODEL` | `ViT-B-32__openai` | CLIP model name |
-| `ML_CLIP_BUFFER_RAM_MB` | `256` | Max RAM for image encode queue (MB) |
 | `ML_FACE_MODEL` | `buffalo_l` | Face recognition model (buffalo_s/m/l) |
 | `ML_FACE_MIN_SCORE` | `0.7` | Face detection confidence threshold |
 | `ML_OCR_LANGUAGE_CORRECTION` | `true` | Language correction for OCR (disable for codes/serials) |
