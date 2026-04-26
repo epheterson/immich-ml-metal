@@ -15,8 +15,8 @@ pyobjc-framework-CoreML>=10.0
 
 # MLX for CLIP (Apple Silicon optimized)
 # Requires macOS >= 14.0, Python >= 3.10
-# Current stable: 0.30.x (Dec 2025)
-mlx>=0.22.0
+# 0.31.2 crashes with "no Stream(gpu, 0)" in thread pool (#38)
+mlx>=0.22.0,<0.31.2
 huggingface-hub>=0.20.0
 
 # Pin mlx-clip to specific commit for stability
