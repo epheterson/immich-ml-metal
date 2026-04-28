@@ -331,6 +331,8 @@ def get_clip_model(model_name: str = "ViT-B-32__openai") -> MLXClip:
     global _current_model, _current_model_name
 
     normalized_name = model_name.replace("::", "__")
+    if "/" in normalized_name:
+        normalized_name = normalized_name.split("/")[-1]
 
     with _model_lock:
         if _current_model is not None and _current_model_name != normalized_name:
