@@ -27,7 +27,7 @@ def test_uses_existing_valid_model_pack(monkeypatch, tmp_path):
     model_file = model_dir / "model.onnx"
     model_file.touch()
 
-    monkeypatch.setattr("insightface.model_zoo.model_zoo.get_model", fake_get_model)
+    monkeypatch.setattr(face_embed, "_find_recognition_model", _fake_find_model)
 
     def should_not_download(*args, **kwargs):
         raise AssertionError("unexpected download")
@@ -70,7 +70,7 @@ def test_coreml_provider_options_format(monkeypatch, tmp_path):
         captured['provider_options'] = kwargs.get('provider_options')
         return MagicMock()
 
-    monkeypatch.setattr("src.models.face_embed.model_zoo.get_model", fake_get_model)
+    monkeypatch.setattr("insightface.model_zoo.model_zoo.get_model", fake_get_model)
     monkeypatch.setattr("src.models.face_embed._find_recognition_model", 
                         lambda _: tmp_path / "model.onnx")
     (tmp_path / "model.onnx").touch()
