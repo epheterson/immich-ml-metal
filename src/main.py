@@ -469,6 +469,7 @@ async def _process_predict(
     text: Optional[str],
 ) -> JSONResponse:
     """Internal predict processing (assumes semaphore is held)."""
+    logger.info("entries raw: %s", entries)
     # Parse the entries JSON
     try:
         tasks = json.loads(entries)
