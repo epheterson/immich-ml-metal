@@ -27,7 +27,7 @@ def test_uses_existing_valid_model_pack(monkeypatch, tmp_path):
     model_file = model_dir / "model.onnx"
     model_file.touch()
 
-    monkeypatch.setattr(face_embed, "_find_recognition_model", _fake_find_model)
+    monkeypatch.setattr("insightface.model_zoo.model_zoo.get_model", fake_get_model)
 
     def should_not_download(*args, **kwargs):
         raise AssertionError("unexpected download")
