@@ -13,16 +13,18 @@ from typing import Optional
 import io
 import gc
 import logging
+import shutil
 import threading
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Model name mapping: Immich name -> MLX repo (or None to use open_clip fallback)
+# Model name mapping: Immich name -> MLX repo (or None to use local conversion / open_clip fallback)
 MODEL_MAP = {
     # OpenAI CLIP models -> MLX
     "ViT-B-32__openai": "mlx-community/clip-vit-base-patch32",
     "ViT-B-16__openai": "mlx-community/clip-vit-base-patch16",
-    "ViT-L-14__openai": None,  # MLX community port has wrong projection_dim (512 vs 768)
+    "ViT-L-14__openai": None,  # No reliable MLX community port — auto-converted on first use
     # LAION CLIP models -> MLX
     "ViT-B-32__laion2b-s34b-b79k": "mlx-community/clip-vit-base-patch32-laion2b",
     "ViT-B-32__laion2b_s34b_b79k": "mlx-community/clip-vit-base-patch32-laion2b",
@@ -46,6 +48,19 @@ OPENCLIP_MAP = {
     "ViT-SO400M-16-SigLIP2-384__webli": ("ViT-SO400M-16-SigLIP2-384", "webli"),
 }
 
+# HuggingFace repo IDs for models that can be auto-converted to MLX.
+# Keyed by Immich model name. Only models with MODEL_MAP entry of None
+# and a known HF source belong here — everything else uses open_clip fallback.
+HF_REPO_MAP = {
+    "ViT-L-14__openai": "openai/clip-vit-large-patch14",
+    "ViT-B-16__openai": "openai/clip-vit-base-patch16",
+    "ViT-B-32__laion2b-s34b-b79k": "laion/CLIP-ViT-B-32-laion2b-s34b-b79k",
+    "ViT-B-32__laion2b_s34b_b79k": "laion/CLIP-ViT-B-32-laion2b-s34b-b79k",
+}
+
+# Directory where auto-converted MLX models are cached.
+MLX_CACHE_DIR = Path.home() / ".cache" / "immich-ml-metal" / "mlx-models"
+
 
 class MLXClip:
     """CLIP model using MLX for Apple Silicon acceleration."""
@@ -65,21 +80,28 @@ class MLXClip:
         self._load_model()
 
     def _load_model(self):
-        """Load the MLX CLIP model, or fallback to open_clip."""
+        """Load the MLX CLIP model, falling back to auto-conversion then open_clip."""
         self._repo_id = MODEL_MAP.get(self.model_name)
 
-        if self._repo_id is None and self.model_name not in OPENCLIP_MAP:
-            logger.warning(
-                f"Unknown model '{self.model_name}', using MLX default (ViT-B-32)"
-            )
-            self._repo_id = MODEL_MAP["default"]
+        if self._repo_id is None:
+            # No pre-built MLX community model. Check for (or create) a local
+            # converted model before giving up and falling back to open_clip.
+            local_path = self._get_or_create_local_mlx(self.model_name)
+            if local_path is not None:
+                self._repo_id = str(local_path)
 
         if self._repo_id is None:
-            logger.info(
-                f"No MLX version for {self.model_name}, using open_clip fallback"
-            )
-            self._load_fallback()
-            return
+            if self.model_name not in OPENCLIP_MAP:
+                logger.warning(
+                    f"Unknown model '{self.model_name}', using MLX default (ViT-B-32)"
+                )
+                self._repo_id = MODEL_MAP["default"]
+            else:
+                logger.info(
+                    f"No MLX version for {self.model_name}, using open_clip fallback"
+                )
+                self._load_fallback()
+                return
 
         try:
             from mlx_clip import mlx_clip
@@ -96,6 +118,52 @@ class MLXClip:
             logger.error(f"MLX model loading failed: {e}", exc_info=True)
             logger.info("Falling back to open_clip")
             self._load_fallback()
+
+    def _get_or_create_local_mlx(self, model_name: str) -> Optional[Path]:
+        """
+        Return the path to a local MLX-converted model, converting from HuggingFace
+        on first use if needed.
+
+        Models are stored under MLX_CACHE_DIR / <model_name> and keyed by Immich
+        model name so different models never collide. Returns None if conversion
+        is not possible (model not in HF_REPO_MAP) or if conversion fails.
+
+        Note: conversion downloads ~1-2 GB and takes a few minutes. This happens
+        once per model per machine and is cached permanently.
+        """
+        if model_name not in HF_REPO_MAP:
+            return None
+
+        local_path = MLX_CACHE_DIR / model_name
+
+        if local_path.exists() and any(local_path.glob("*.safetensors")):
+            logger.info(f"Using cached MLX model at {local_path}")
+            return local_path
+
+        hf_repo = HF_REPO_MAP[model_name]
+        logger.info(
+            f"No local MLX model found for {model_name}. "
+            f"Converting from {hf_repo} — this downloads ~2 GB and runs once."
+        )
+
+        try:
+            from mlx_clip.convert import convert_weights
+
+            local_path.mkdir(parents=True, exist_ok=True)
+            convert_weights(hf_repo, str(local_path))
+            logger.info(f"Conversion complete. Model cached at {local_path}")
+            return local_path
+
+        except Exception as e:
+            logger.error(
+                f"MLX conversion failed for {model_name} ({hf_repo}): {e}",
+                exc_info=True,
+            )
+            # Remove partial output so the next startup retries cleanly
+            # rather than finding an incomplete model directory.
+            if local_path.exists():
+                shutil.rmtree(local_path)
+            return None
 
     def _load_fallback(self):
         """Fallback to open_clip with MPS acceleration."""
