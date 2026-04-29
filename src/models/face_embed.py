@@ -153,8 +153,21 @@ def _load_model(model_name: str):
     logger.info(f"ONNX Runtime providers available: {available}")
 
     if "CoreMLExecutionProvider" in available:
-        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-        logger.info("Using CoreML for face recognition")
+        cache_dir = Path.home() / ".insightface" / "coreml_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        providers = [
+            (
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "CPUAndNeuralEngine",
+                    "RequireStaticInputShapes": "1",
+                    "ModelCacheDirectory": str(cache_dir),
+                },
+            ),
+            "CPUExecutionProvider",
+        ]
+        logger.info("Using CoreML for face recognition (MLProgram, ANE, static shapes only)")
     else:
         providers = ["CPUExecutionProvider"]
         logger.info("Using CPU for face recognition (CoreML not available)")
