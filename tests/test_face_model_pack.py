@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 
 import pytest
+from unittest.mock import MagicMock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "models" / "face_embed.py"
 SPEC = importlib.util.spec_from_file_location("face_embed_test_module", MODULE_PATH)
