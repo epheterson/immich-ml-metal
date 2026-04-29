@@ -23,7 +23,7 @@ huggingface-hub>=0.20.0
 mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c
 
 # Fallback if you want to use open_clip instead of mlx-clip:
-# open-clip-torch>=2.24.0
+open-clip-torch>=2.24.0
 
 # Face recognition - official onnxruntime supports Apple Silicon via CoreML
 # onnxruntime 1.18+ supports numpy 2.x
