@@ -22,7 +22,7 @@ MODEL_MAP = {
     # OpenAI CLIP models -> MLX
     "ViT-B-32__openai": "mlx-community/clip-vit-base-patch32",
     "ViT-B-16__openai": "mlx-community/clip-vit-base-patch16",
-    "ViT-L-14__openai": "mlx-community/clip-vit-large-patch14",
+    "ViT-L-14__openai": None,  # MLX community port has wrong projection_dim (512 vs 768)
     # LAION CLIP models -> MLX
     "ViT-B-32__laion2b-s34b-b79k": "mlx-community/clip-vit-base-patch32-laion2b",
     "ViT-B-32__laion2b_s34b_b79k": "mlx-community/clip-vit-base-patch32-laion2b",
