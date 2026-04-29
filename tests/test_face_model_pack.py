@@ -60,6 +60,35 @@ def test_recovers_from_invalid_pack_with_leftover_onnx(monkeypatch, tmp_path):
     assert result == model_dir / "model.onnx"
     assert result.exists()
 
+def test_coreml_provider_options_format(monkeypatch, tmp_path):
+    """Ensure CoreML providers and provider_options are passed as parallel lists,
+    not as a list of tuples — insightface requires this format."""
+    captured = {}
+
+    def fake_get_model(path, **kwargs):
+        captured['providers'] = kwargs.get('providers')
+        captured['provider_options'] = kwargs.get('provider_options')
+        return MagicMock()
+
+    monkeypatch.setattr("src.models.face_embed.model_zoo.get_model", fake_get_model)
+    monkeypatch.setattr("src.models.face_embed._find_recognition_model", 
+                        lambda _: tmp_path / "model.onnx")
+    (tmp_path / "model.onnx").touch()
+
+    import onnxruntime as ort
+    monkeypatch.setattr(ort, "get_available_providers", 
+                        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"])
+
+    from src.models.face_embed import _load_model
+    _load_model("buffalo_l")
+
+    assert isinstance(captured['providers'], list)
+    assert isinstance(captured['provider_options'], list)
+    # Must be parallel lists, not tuples
+    assert all(isinstance(p, str) for p in captured['providers'])
+    assert len(captured['providers']) == len(captured['provider_options'])
+    # CoreML options must include cache directory
+    assert "ModelCacheDirectory" in captured['provider_options'][0]
 
 def test_downloads_when_model_pack_missing(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)

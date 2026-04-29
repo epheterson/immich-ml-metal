@@ -155,21 +155,20 @@ def _load_model(model_name: str):
     if "CoreMLExecutionProvider" in available:
         cache_dir = Path.home() / ".insightface" / "coreml_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        providers = [
-            (
-                "CoreMLExecutionProvider",
-                {
-                    "ModelFormat": "MLProgram",
-                    "MLComputeUnits": "CPUAndNeuralEngine",
-                    "RequireStaticInputShapes": "1",
-                    "ModelCacheDirectory": str(cache_dir),
-                },
-            ),
-            "CPUExecutionProvider",
+        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        provider_options = [
+            {
+                "ModelFormat": "MLProgram",
+                "MLComputeUnits": "CPUAndNeuralEngine",
+                "RequireStaticInputShapes": "1",
+                "ModelCacheDirectory": str(cache_dir),
+            },
+            {},
         ]
         logger.info("Using CoreML for face recognition (MLProgram, ANE, static shapes only)")
     else:
         providers = ["CPUExecutionProvider"]
+        provider_options = [{}]
         logger.info("Using CPU for face recognition (CoreML not available)")
 
     rec_model_path = _ensure_recognition_model_pack(model_name, download_model_pack)
@@ -178,7 +177,9 @@ def _load_model(model_name: str):
 
     try:
         _recognition_model = model_zoo.get_model(
-            str(rec_model_path), providers=providers
+            str(rec_model_path),
+            providers=providers,
+            provider_options=provider_options,
         )
         logger.info(f"Successfully loaded face recognition model: {model_name}")
     except Exception as e:
