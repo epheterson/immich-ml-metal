@@ -152,6 +152,15 @@ def _load_model(model_name: str):
     available = ort.get_available_providers()
     logger.info(f"ONNX Runtime providers available: {available}")
 
+
+# NOTE: ModelCacheDirectory is passed but currently has no effect in the ORT Python bindings.
+# This is a known ORT bug (https://github.com/microsoft/onnxruntime/issues/23228) —
+# the option is silently accepted but never written to disk. CoreML MLProgram compilation
+# (~6-7s) therefore happens on the first request after every service restart rather than
+# being persisted. The option is left in place so it activates automatically if/when
+# the bug is fixed in a future ORT release. To track: upgrade onnxruntime and check
+# whether ~/.insightface/coreml_cache/ gets populated after a single-face request.
+
     if "CoreMLExecutionProvider" in available:
         cache_dir = Path.home() / ".insightface" / "coreml_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
