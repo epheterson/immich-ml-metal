@@ -31,6 +31,7 @@ MODEL_MAP = {
     # SigLIP models -> None (use open_clip fallback)
     "ViT-B-16-SigLIP__webli": None,
     "ViT-B-16-SigLIP2__webli": None,
+    "ViT-L-16-SigLIP2-256__webli": None,
     "ViT-SO400M-16-SigLIP2-384__webli": None,
     # Default fallback
     "default": "mlx-community/clip-vit-base-patch32",
@@ -45,6 +46,7 @@ OPENCLIP_MAP = {
     "ViT-B-32__laion2b_s34b_b79k": ("ViT-B-32", "laion2b_s34b_b79k"),
     "ViT-B-16-SigLIP__webli": ("ViT-B-16-SigLIP", "webli"),
     "ViT-B-16-SigLIP2__webli": ("ViT-B-16-SigLIP2", "webli"),
+    "ViT-L-16-SigLIP2-256__webli": ("ViT-L-16-SigLIP2-256", "webli"),
     "ViT-SO400M-16-SigLIP2-384__webli": ("ViT-SO400M-16-SigLIP2-384", "webli"),
 }
 
