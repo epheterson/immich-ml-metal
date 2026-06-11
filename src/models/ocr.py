@@ -116,18 +116,18 @@ def _recognize_text_impl(
             # Get bounding box (normalized coordinates, origin at bottom-left)
             bbox = observation.boundingBox()
             
-            # Convert to pixel coordinates (flip Y axis)
-            x = bbox.origin.x * img_width
-            y = (1.0 - bbox.origin.y - bbox.size.height) * img_height
-            w = bbox.size.width * img_width
-            h = bbox.size.height * img_height
+            # Calculate coordinates (flip Y axis)
+            x = bbox.origin.x
+            y = 1.0 - bbox.origin.y - bbox.size.height
+            w = bbox.size.width
+            h = bbox.size.height
             
             # Immich expects 8 coordinates per box (quadrilateral corners)
             # Order: top-left, top-right, bottom-right, bottom-left (clockwise)
-            x1, y1 = int(x), int(y)              # top-left
-            x2, y2 = int(x + w), int(y)          # top-right
-            x3, y3 = int(x + w), int(y + h)      # bottom-right
-            x4, y4 = int(x), int(y + h)          # bottom-left
+            x1, y1 = x, y              # top-left
+            x2, y2 = x + w, y          # top-right
+            x3, y3 = x + w, y + h      # bottom-right
+            x4, y4 = x, y + h          # bottom-left
             
             boxes.extend([x1, y1, x2, y2, x3, y3, x4, y4])
             
