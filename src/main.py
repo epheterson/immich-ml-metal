@@ -212,7 +212,7 @@ class FaceDetection(BaseModel):
 
 class OCRResult(BaseModel):
     text: list[str]
-    box: list[int]  # Flat list of coordinates
+    box: list[float]  # Flat list of coordinates
     boxScore: list[float]
     textScore: list[float]
 
@@ -616,22 +616,22 @@ async def _process_predict(
                 {
                     "text": ["placeholder", "text"],
                     "box": [
-                        0,
-                        0,
-                        100,
-                        0,
-                        100,
-                        50,
-                        0,
-                        50,
-                        0,
-                        50,
-                        100,
-                        50,
-                        100,
-                        100,
-                        0,
-                        100,
+                        0.1,
+                        0.3,
+                        0.5,
+                        0.3,
+                        0.5,
+                        0.4,
+                        0.1,
+                        0.4,
+                        0.2,
+                        0.4,
+                        0.6,
+                        0.4,
+                        0.6,
+                        0.5,
+                        0.2,
+                        0.5,
                     ],
                     "boxScore": [0.95, 0.92],
                     "textScore": [0.98, 0.96],
