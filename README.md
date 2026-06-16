@@ -1,39 +1,25 @@
 # immich-ml-metal
 
-> **⚠️ Important Disclaimer**: I (the repository owner) am not a software developer. This project was architected, designed, and primarily authored by Claude based on my requirements and feedback. While I've tested it in my home environment, please treat this as an **experimental community project** rather than production-ready software. I'm sharing this in hopes it's useful for the Mac community. If it's not helpful for you, please don't feel pressured to use it.
+A Metal/ANE-accelerated drop-in replacement for [Immich's](https://immich.app/) machine learning service, built for Apple Silicon Macs.
 
-A Metal/ANE-optimized drop-in replacement for [Immich's](https://immich.app/) machine learning service, designed specifically for Apple Silicon Macs. This allows Mac users to run Immich's ML workloads natively on their hardware.
+> **Heads up:** I'm not a software developer. This was architected and largely written by Claude against my requirements, and tested only in my own home setup. Treat it as an experimental community project, not production software. Contributions from actual developers are very welcome.
 
-## What This Does
+## What it does
 
-Immich's standard ML container runs well on NVIDIA, Intel, and AMD GPUs. Recently, the community has had trouble running it natively on Apple's ML framework (particularly after OCR was implemented). This project is a drop-in replacement for Immich-ML that uses the same ML API but uses as many native Apple ML frameworks as possible:
+Immich's standard ML container runs well on NVIDIA, Intel, and AMD GPUs but has been hard to run natively on Apple's frameworks (especially since OCR was added). This service speaks the same ML API as Immich's, but routes each task to a native Apple framework:
 
-- **CLIP Embeddings**: MLX-accelerated (with open_clip fallback) for image/text search
-- **Face Detection**: Apple Vision framework (runs on Neural Engine)
-- **Face Recognition**: InsightFace ArcFace with CoreML acceleration
-- **OCR**: Apple Vision framework text recognition
-
-## Performance: Why This is Fast
-
-Apple Silicon has three independent compute units — GPU (Metal), Neural Engine (ANE), and CPU. This service runs ML tasks across all three concurrently:
-
-| Task | Compute Unit | Framework |
+| Task | Compute unit | Framework |
 |------|-------------|-----------|
-| CLIP embedding | GPU (Metal) | MLX / open_clip MPS |
+| CLIP embeddings | GPU (Metal) | MLX, with open_clip/MPS fallback |
 | Face detection | ANE | Apple Vision |
-| Face embedding | CPU / CoreML | InsightFace ONNX |
+| Face recognition | CPU / CoreML | InsightFace ArcFace (ONNX) |
 | OCR | ANE | Apple Vision |
 
-Within a single `/predict` request, CLIP, face recognition, and OCR run simultaneously via `asyncio.gather`. Face embeddings are batched into a single ONNX inference call regardless of how many faces are in the photo.
+## Performance
 
-**Benchmarks (M4, 24GB):**
+Within a single `/predict` request, CLIP, face recognition, and OCR are dispatched together via `asyncio.gather`, so the Vision-framework tasks (face detection, OCR) and the ONNX face-embedding step can overlap. Face embeddings for all faces in a photo are batched into a single ONNX call.
 
-| Photo | Faces | Latency |
-|-------|-------|---------|
-| 3.5MB portrait | 0 | 134ms |
-| 5.5MB landscape | 0 | 149ms |
-| 26MB group photo | 3 | 602ms |
-| 23MB group photo | 5 | 589ms |
+One caveat worth knowing: MLX and Apple's Vision framework both submit Metal work, and concurrent access crashes the process, so CLIP's GPU inference is serialized behind a global Metal lock. CLIP and the Vision tasks therefore don't run fully in parallel — but the batching and the overlap of the non-MLX work still add up.
 
 Per-task timing is logged on every request:
 ```
@@ -44,121 +30,103 @@ INFO:   ocr: 47ms
 INFO: predict: 3 task(s) [clip+facial-recognition+ocr] completed in 135ms
 ```
 
-## Project Status
-
-** A(I)lpha Quality - Use at Your Own Risk**
-
-- [x] CLIP implementation (MLX + open_clip fallback)
-- [x] Face detection (Vision framework)
-- [x] Face embeddings (InsightFace + CoreML)
-- [x] OCR (Vision framework)
-- [x] Basic integration testing with real Immich instance
-- [ ] Community testing and validation
-
-**Known Limitations:**
-- Only tested in my specific home setup (MacBook Pro M1, macOS 26.1, Immich v2.4.1)
-- Not all Immich ML features may be fully compatible
-- Memory usage not extensively optimized
-- No load testing performed
-- Could literally only work on my machine(tm)
-
 ## Requirements
 
-- **macOS Tahoe+** (Might work on earlier OSs, but you'd have to test it yourself)
-- **Apple Silicon Mac** (M1/M2/M3/M4 - Intel Macs not supported)
-- **Python 3.11** (Not working on 3.13)
-- **Immich server** already running (this replaces just the ML service)
+- Apple Silicon Mac (M1/M2/M3/M4 — Intel not supported)
+- macOS Tahoe (26) or later — may work on earlier, untested
+- Python 3.11 (3.13 lacks some required wheels)
+- Xcode Command Line Tools (`xcode-select --install`) — `insightface` builds from source and needs a compiler
+- A running Immich server (this replaces only the ML service)
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/sebastianfredette/immich-ml-metal.git
 cd immich-ml-metal
 
-# Pin mlx-clip to a specific commit (for stability)
-# Get the current commit hash:
-git ls-remote https://github.com/harperreed/mlx_clip.git HEAD
-# Edit requirements.txt and replace the tail end of the mlx_clip.git address with the new hash
-
-# Create and activate virtual environment
-# Please ensure python 3.11 is used — 3.13 doesn't yet have all required wheels
-python3 -m venv .venv
+# Use Python 3.11 — 3.13 doesn't yet have all required wheels
+python3.11 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 
-# First run will download models
+# First run downloads models
 python -m src.main
 ```
 
+`mlx-clip` is already pinned to a known-good commit in `requirements.txt`. Bump that pin yourself only if you want a newer version.
+
 ## Configuration
 
-Configure via environment variables or edit `src/config.py`:
+### Choosing models — do this in Immich, not here
+
+CLIP and face recognition models are selected in **Immich's admin panel** (Administration → Settings → Machine Learning), and Immich sends the chosen model with every request. This service uses whatever each request specifies. The `ML_CLIP_MODEL` / `ML_FACE_MODEL` environment variables below are only *fallback defaults* for the rare request that omits a model — setting them will **not** override what you've configured in Immich. If you want a different model, change it in Immich.
+
+What this service controls is which models are *supported* and how each one is loaded.
+
+### Supported CLIP models
+
+The model name Immich sends is resolved through three lookup tables in `src/models/clip.py` (`MODEL_MAP`, `HF_REPO_MAP`, `OPENCLIP_MAP`), and a given name can end up loaded one of four ways:
+
+1. **Prebuilt MLX** — a ready-made `mlx-community` port exists; loaded directly via MLX (fastest path, no conversion).
+2. **Converted MLX** — no prebuilt port, but a HuggingFace source is known. Converted to MLX on **first use** and cached under `~/.cache/immich-ml-metal/mlx-models/<name>` (~1–2GB download, a few minutes — happens once per model per machine, so the first request after selecting such a model is slow).
+3. **open_clip fallback** — no MLX path at all (e.g. SigLIP); runs through open_clip on MPS instead. Works, but slower than MLX.
+4. **Default** — an unrecognized name silently falls back to `ViT-B-32` (prebuilt MLX).
+
+Note also: if `mlx_clip` can't be imported for any reason, **everything** routes to the open_clip fallback regardless of the above.
+
+| Immich model name | How it loads |
+|-------------------|--------------|
+| `ViT-B-32__openai` | Prebuilt MLX |
+| `ViT-B-16__openai` | Prebuilt MLX |
+| `ViT-B-32__laion2b-s34b-b79k` | Prebuilt MLX |
+| `ViT-B-32__laion2b_s34b_b79k` | Prebuilt MLX (alias of the above) |
+| `ViT-L-14__openai` | Converted MLX on first use |
+| `ViT-B-16-SigLIP__webli` | open_clip fallback |
+| `ViT-B-16-SigLIP2__webli` | open_clip fallback |
+| `ViT-L-16-SigLIP2-256__webli` | open_clip fallback |
+| `ViT-SO400M-16-SigLIP2-384__webli` | open_clip fallback |
+| anything else | Default (`ViT-B-32`) |
+
+This table reflects the maps at time of writing — `src/models/clip.py` is the source of truth if they've diverged.
+
+### Supported face models
+
+`buffalo_s`, `buffalo_m`, `buffalo_l` (InsightFace ArcFace, via ONNX + CoreML).
+
+### Environment variables
+
+Set via environment, or edit defaults in `src/config.py` (the full list lives there). The ones you're most likely to touch:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ML_HOST` | `0.0.0.0` | Bind address |
-| `ML_PORT` | `3003` | Port number (must match Immich config) |
-| `ML_MODELS_DIR` | `./models` | Model storage directory |
-| `ML_CLIP_MODEL` | `ViT-B-32__openai` | CLIP model name |
-| `ML_FACE_MODEL` | `buffalo_l` | Face recognition model (buffalo_s/m/l) |
+| `ML_PORT` | `3003` | Port (must match Immich's `MACHINE_LEARNING_URL`) |
 | `ML_FACE_MIN_SCORE` | `0.7` | Face detection confidence threshold |
-| `ML_OCR_LANGUAGE_CORRECTION` | `true` | Language correction for OCR (disable for codes/serials) |
-| `ML_USE_COREML` | `true` | Enable CoreML acceleration |
-| `ML_USE_ANE` | `true` | Enable Apple Neural Engine |
-| `ML_MAX_CONCURRENT_REQUESTS` | `4` | Max queued requests before backpressure |
-| `MODEL_UNLOAD_STRATEGY` | `pressure` | `pressure`: unload when RAM is low + idle. `timeout`: unload after idle timeout. `never`: keep loaded. |
-| `MODEL_IDLE_TIMEOUT` | `120` | Seconds before unloading idle models (only used with `timeout` strategy) |
-| `MODEL_MEMORY_FLOOR_MB` | `500` | Available RAM threshold that triggers model unloading (only used with `pressure` strategy) |
-| `ML_LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG/INFO/WARNING/ERROR) |
-| `ML_LOG_REQUESTS` | `true` | Log individual requests (disable for high volume) |
-| `ML_DEBUG_MODE` | `false` | Expose error details (keep false when network-exposed) |
-
-### Model Choices
-
-**CLIP Model Mapping**:
-- OpenAI CLIP models -> MLX
-  - `ViT-B-32__openai` -> `mlx-community/clip-vit-base-patch32`
-  - `ViT-B-16__openai`-> `mlx-community/clip-vit-base-patch16`
-  - `ViT-L-14__openai`-> `mlx-community/clip-vit-large-patch14`
-    
-- LAION CLIP models -> MLX
-  - `ViT-B-32__laion2b-s34b-b79k`-> `mlx-community/clip-vit-base-patch32-laion2b`
-  - `ViT-B-32__laion2b_s34b_b79k`-> `mlx-community/clip-vit-base-patch32-laion2b`
-    
-- SigLIP models -> None (uses open_clip fallback)
-  - `ViT-B-16-SigLIP__webli`
-  - `ViT-B-16-SigLIP2__webli`
-  - `ViT-SO400M-16-SigLIP2-384__webli`
-    
-- Default fallback: `mlx-community/clip-vit-base-patch32`
-
-**Face Models**:
-- `buffalo_s`
-- `buffalo_m`
-- `buffalo_l` - **default**
+| `ML_OCR_LANGUAGE_CORRECTION` | `true` | Disable for serials/codes |
+| `MODEL_UNLOAD_STRATEGY` | `pressure` | `pressure` (unload idle models when RAM low), `timeout`, or `never` |
+| `ML_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `ML_CLIP_MODEL` | `ViT-B-32__openai` | *Fallback* CLIP model (overridden per-request by Immich) |
+| `ML_FACE_MODEL` | `buffalo_l` | *Fallback* face model (overridden per-request by Immich) |
 
 ## Connecting to Immich
 
-In your Immich `docker-compose.yml` or `.env`:
+In your Immich `docker-compose.yml` or `.env`, point the ML URL at your Mac:
 
 ```yaml
-# Point to your Mac's IP address (not localhost unless Immich is also native)
 MACHINE_LEARNING_URL=http://192.168.1.100:3003
 ```
 
-## Actually Running the Service
+## Running the service
 
 ```bash
 source .venv/bin/activate
-uvicorn src.main:app --host 0.0.0.0 --port 3003 --workers 1
+python -m uvicorn src.main:app --host 0.0.0.0 --port 3003 --workers 1
 ```
 
-### Running as a Service (macOS launchd):
+### As a persistent service (launchd)
 
-Create `~/Library/LaunchAgents/com.immich.ml.plist`:
+Create `~/Library/LaunchAgents/com.immich.ml.plist`, adjusting the paths:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -169,9 +137,16 @@ Create `~/Library/LaunchAgents/com.immich.ml.plist`:
     <string>com.immich.ml</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/path/to/your/.venv/bin/python</string>
+        <string>/path/to/immich-ml-metal/.venv/bin/python</string>
         <string>-m</string>
-        <string>src.main</string>
+        <string>uvicorn</string>
+        <string>src.main:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>3003</string>
+        <string>--workers</string>
+        <string>1</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/path/to/immich-ml-metal</string>
@@ -180,63 +155,37 @@ Create `~/Library/LaunchAgents/com.immich.ml.plist`:
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/immich-ml.log</string>
+    <string>/path/to/logs/immich-ml.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/immich-ml-error.log</string>
+    <string>/path/to/logs/immich-ml-error.log</string>
 </dict>
 </plist>
 ```
 
-Then:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.immich.ml.plist
 launchctl start com.immich.ml
 ```
 
+A LaunchAgent (under `~/Library/LaunchAgents`) runs in your user's GUI session, which the Apple frameworks need. Note that macOS doesn't rotate these logs.
+
+> **Cold-start note:** CoreML compiles the face model on the first request after each restart (~6–7s). ONNX Runtime's `ModelCacheDirectory` option is currently ignored due to an [upstream bug](https://github.com/microsoft/onnxruntime/issues/23228), so this recompile isn't yet persisted across restarts.
+
 ## Verification
 
-Test the service is working:
-
 ```bash
-# Health check
-curl http://localhost:3003/ping
-# Should return: pong
+curl http://localhost:3003/ping            # -> pong
+curl http://localhost:3003/health           # component health check
 
-# Service info
-curl http://localhost:3003/
-# Should return: {"message":"Immich ML"}
-
-# Detailed health (checks all components)
-curl http://localhost:3003/health
-# Should return: {"status":"healthy","checks":{...}}
-
-# Test CLIP text encoding
 curl -X POST http://localhost:3003/predict \
   -F 'entries={"clip":{"textual":{"modelName":"ViT-B-32__openai"}}}' \
   -F 'text=a photo of a cat'
 ```
 
-In Immich, you should see the ML service connect in the admin logs.
+In Immich's admin logs you should see the ML service connect.
 
-## Contributing
+## Status & contributing
 
-Given this is primarily an AI-assisted project, contributions are **very welcome**, especially from actual developers who can:
+Alpha quality — use at your own risk. Tested on a MacBook Pro M1 (8GB) and an M4 Mac mini (16GB), macOS 26.1, Immich v2.4.1. Not all Immich ML features are guaranteed compatible, and memory use isn't heavily optimized.
 
-- Review and improve the code quality
-- Add proper tests
-- Verify Immich compatibility  
-- Optimize performance
-- Add missing features
-- Improve documentation
-
-## Support
-
-This is a hobby project with no guarantees. I barely know how to use Git.
-
-## Final Notes
-
-This project exists because I wanted to run Immich ML on my Mac with passable hardware acceleration. **It works for me**, but may not work for everyone. Use at your own risk, and please contribute improvements if you can!
-
----
-
-**tl;dr**: AI-written Immich ML service for Apple Silicon. Alpha quality. Use with caution. Please help.
+Contributions especially welcome from developers who can review code quality, add tests, verify Immich compatibility, or improve docs. No guarantees — this is a hobby project.
