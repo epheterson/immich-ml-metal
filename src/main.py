@@ -154,10 +154,25 @@ def _start_idle_monitor() -> None:
     logger.info("Model memory monitor started (strategy=%s)", MODEL_UNLOAD_STRATEGY)
 
 
+def _init_ml_thread():
+    """Initialize MLX GPU stream for this worker thread.
+    MLX streams are per-thread. Without this, the first MLX call in a
+    fresh pool thread crashes with 'There is no Stream(gpu, 0)'."""
+    if not STUB_MODE:
+        try:
+            import mlx.core as mx
+            _ = mx.array([0.0])
+            mx.eval(_)
+        except Exception:
+            pass  # Non-MLX paths (face/OCR threads) don't need this
+
+
 # Dedicated thread pool for ML inference — reuses threads instead of
-# creating a new one per asyncio.to_thread() call.
+# creating a new one per asyncio.to_thread() call. 
 _inference_pool = ThreadPoolExecutor(
-    max_workers=settings.max_concurrent_requests, thread_name_prefix="ml-inference"
+    max_workers=settings.max_concurrent_requests,
+    thread_name_prefix="ml-inference",
+    initializer=_init_ml_thread,
 )
 
 
@@ -197,7 +212,7 @@ class FaceDetection(BaseModel):
 
 class OCRResult(BaseModel):
     text: list[str]
-    box: list[int]  # Flat list of coordinates
+    box: list[float]  # Flat list of coordinates
     boxScore: list[float]
     textScore: list[float]
 
@@ -454,6 +469,7 @@ async def _process_predict(
     text: Optional[str],
 ) -> JSONResponse:
     """Internal predict processing (assumes semaphore is held)."""
+    logger.info("entries raw: %s", entries)
     # Parse the entries JSON
     try:
         tasks = json.loads(entries)
@@ -518,11 +534,13 @@ async def _process_predict(
                 embedding = np.random.randn(512).astype(np.float32)
                 embedding = embedding / np.linalg.norm(embedding)
             else:
-                clip = get_clip(model_name)
-                try:
-                    embedding = await _run_in_pool(clip.encode_image, image_bytes)
-                finally:
-                    _track_model_use("clip")
+                def _load_and_encode_image():
+                    clip = get_clip(model_name)
+                    try:
+                        return clip.encode_image(image_bytes)
+                    finally:
+                        _track_model_use("clip")
+                embedding = await _run_in_pool(_load_and_encode_image)
 
             return ("clip", str(embedding.tolist()))
 
@@ -533,11 +551,13 @@ async def _process_predict(
                 embedding = np.random.randn(512).astype(np.float32)
                 embedding = embedding / np.linalg.norm(embedding)
             else:
-                clip = get_clip(model_name)
-                try:
-                    embedding = await _run_in_pool(clip.encode_text, text)
-                finally:
-                    _track_model_use("clip")
+                def _load_and_encode_text():
+                    clip = get_clip(model_name)
+                    try:
+                        return clip.encode_text(text)
+                    finally:
+                        _track_model_use("clip")
+                embedding = await _run_in_pool(_load_and_encode_text)
 
             return ("clip", str(embedding.tolist()))
 
@@ -596,22 +616,22 @@ async def _process_predict(
                 {
                     "text": ["placeholder", "text"],
                     "box": [
-                        0,
-                        0,
-                        100,
-                        0,
-                        100,
-                        50,
-                        0,
-                        50,
-                        0,
-                        50,
-                        100,
-                        50,
-                        100,
-                        100,
-                        0,
-                        100,
+                        0.1,
+                        0.3,
+                        0.5,
+                        0.3,
+                        0.5,
+                        0.4,
+                        0.1,
+                        0.4,
+                        0.2,
+                        0.4,
+                        0.6,
+                        0.4,
+                        0.6,
+                        0.5,
+                        0.2,
+                        0.5,
                     ],
                     "boxScore": [0.95, 0.92],
                     "textScore": [0.98, 0.96],
