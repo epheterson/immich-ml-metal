@@ -225,7 +225,7 @@ async def _process_predict(
 
 **Step 2: Smoke test**
 
-Run: `cd /Users/elp/Repos/immich-apple-silicon/ml && STUB_MODE=true python3 -c "import asyncio; from src.main import app"`
+Run: `cd $HOME/immich-apple-silicon/ml && STUB_MODE=true python3 -c "import asyncio; from src.main import app"`
 Expected: No import errors
 
 **Step 3: Commit**
@@ -382,7 +382,7 @@ def _run_face_recognition_sync(
 
 **Step 3: Smoke test**
 
-Run: `cd /Users/elp/Repos/immich-apple-silicon/ml && STUB_MODE=true python3 -c "from src.models.face_embed import get_face_embeddings_batch; print('import ok')"`
+Run: `cd $HOME/immich-apple-silicon/ml && STUB_MODE=true python3 -c "from src.models.face_embed import get_face_embeddings_batch; print('import ok')"`
 Expected: `import ok`
 
 **Step 4: Commit**
@@ -442,7 +442,7 @@ Note: The fallback path (open_clip/torch) still needs the full lock because `_en
 
 **Step 2: Smoke test**
 
-Run: `cd /Users/elp/Repos/immich-apple-silicon/ml && python3 -c "from src.models.clip import MLXClip; print('import ok')"`
+Run: `cd $HOME/immich-apple-silicon/ml && python3 -c "from src.models.clip import MLXClip; print('import ok')"`
 Expected: `import ok`
 
 **Step 3: Commit**
@@ -464,7 +464,7 @@ Allows next request's image prep to overlap with current GPU inference."
 
 Run the service in stub mode and hit the predict endpoint:
 ```bash
-cd /Users/elp/Repos/immich-apple-silicon/ml
+cd $HOME/immich-apple-silicon/ml
 STUB_MODE=true python3 -c "
 import asyncio, json
 from src.main import app
@@ -500,7 +500,7 @@ asyncio.run(test())
 **Step 2: Push and create PR**
 
 ```bash
-cd /Users/elp/Repos/immich-apple-silicon/ml
+cd $HOME/immich-apple-silicon/ml
 git push origin main
 ```
 
