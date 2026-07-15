@@ -15,11 +15,11 @@ pyobjc-framework-CoreML>=10.0
 
 # MLX for CLIP (Apple Silicon optimized)
 # Requires macOS >= 14.0, Python >= 3.10
-# 0.31.2 crashes with "no Stream(gpu, 0)" in the worker thread pool (#38); it is
-# the only known-bad build. 0.32.0 is verified fixed (1800 concurrent CLIP
-# inferences from a 4/8-worker pool, no abort), so we exclude just 0.31.2 and cap
-# below the next untested minor. Re-test before allowing 0.33.x.
-mlx>=0.22.0,!=0.31.2,<0.33.0
+# 0.31.2 AND 0.32.0 both crash CLIP inference in the worker thread pool
+# ("There is no Stream(gpu, 0)" / "Stream(cpu, 1)"; #38, #103). 0.31.1 is
+# the last known-good build. A re-test must reproduce the real /predict
+# service path (concurrent), not just mlx_clip.image_encoder, before lifting.
+mlx>=0.22.0,<0.31.2
 huggingface-hub>=0.20.0
 
 # Pin mlx-clip to specific commit for stability
