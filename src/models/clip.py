@@ -35,7 +35,7 @@ class _BatchAccumulator:
     calls when Immich is running a bulk smart-search job.
     """
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = 32
     WAIT_MS = 8  # max time to accumulate before flushing
 
     def __init__(self, model, device, metal_lock: threading.Lock):
