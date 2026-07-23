@@ -47,7 +47,7 @@ class _BatchAccumulator:
     stragglers after a model swap.
     """
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = 32
     WAIT_MS = 8  # max time to accumulate before flushing
 
     def __init__(self, model, device, metal_lock: threading.Lock):
