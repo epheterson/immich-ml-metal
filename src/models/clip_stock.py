@@ -110,12 +110,12 @@ class _StockCLIP:
         arr = (arr - self.mean) / self.std
         return np.expand_dims(arr, axis=0).astype(np.float32)
 
-    def encode_image(self, img) -> list[float]:
+    def encode_image(self, img) -> np.ndarray:
         inputs = {self.visual.get_inputs()[0].name: self._preprocess(img)}
         out = self.visual.run(None, inputs)[0]
         return _normalize(np.asarray(out[0], dtype=np.float32))
 
-    def encode_text(self, text: str) -> list[float]:
+    def encode_text(self, text: str) -> np.ndarray:
         ids = self.tokenizer.encode(text).ids[: self.context_length]
         # CLIP's text tower takes a fixed-width context, zero padded. The index
         # dtype is read from the model rather than assumed: Immich's exports are
@@ -130,11 +130,17 @@ class _StockCLIP:
         return _normalize(np.asarray(out[0], dtype=np.float32))
 
 
-def _normalize(vec: np.ndarray) -> list[float]:
+def _normalize(vec: np.ndarray) -> np.ndarray:
+    """Unit-length, and an ndarray rather than a list.
+
+    The caller does embedding.tolist(), so returning a list here fails with
+    'list object has no attribute tolist' on every request. The mlx path
+    returns an array; this has to match it, not merely carry the same numbers.
+    """
     norm = float(np.linalg.norm(vec))
     if norm == 0:
-        return vec.astype(np.float32).tolist()
-    return (vec / norm).astype(np.float32).tolist()
+        return vec.astype(np.float32)
+    return (vec / norm).astype(np.float32)
 
 
 def get_model(name: str, cache_dir: Path) -> _StockCLIP:
@@ -159,7 +165,7 @@ def unload_model() -> None:
         _model_name = None
 
 
-def encode_image(image_bytes: bytes, name: str, cache_dir: Path) -> list[float]:
+def encode_image(image_bytes: bytes, name: str, cache_dir: Path) -> np.ndarray:
     import io
 
     from PIL import Image
@@ -168,7 +174,7 @@ def encode_image(image_bytes: bytes, name: str, cache_dir: Path) -> list[float]:
     return get_model(name, cache_dir).encode_image(img)
 
 
-def encode_text(text: str, name: str, cache_dir: Path) -> list[float]:
+def encode_text(text: str, name: str, cache_dir: Path) -> np.ndarray:
     return get_model(name, cache_dir).encode_text(text)
 
 
@@ -180,10 +186,10 @@ class StockCLIPModel:
         self._name = name
         self._cache_dir = cache_dir
 
-    def encode_image(self, image_bytes: bytes) -> list[float]:
+    def encode_image(self, image_bytes: bytes) -> np.ndarray:
         return encode_image(image_bytes, self._name, self._cache_dir)
 
-    def encode_text(self, text: str) -> list[float]:
+    def encode_text(self, text: str) -> np.ndarray:
         return encode_text(text, self._name, self._cache_dir)
 
 
