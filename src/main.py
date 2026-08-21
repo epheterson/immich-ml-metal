@@ -294,7 +294,7 @@ def get_clip(model_name: str = "ViT-B-32__openai"):
     """
     if STUB_MODE:
         return None
-    from .models.clip import get_clip_model
+    from .models import get_clip_model
 
     _mark_model_busy("clip")
     try:

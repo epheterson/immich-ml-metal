@@ -7,7 +7,23 @@ Model implementations for immich-ml-metal.
 - ocr: Text recognition (Apple Vision framework)
 """
 
-from .clip import get_clip_model, MLXClip
+from .clip import get_clip_model as get_clip_model_mlx, MLXClip
+
+
+def get_clip_model(model_name):
+    """Return whichever CLIP this install is configured for.
+
+    Same seam as faces and OCR. Stock runs Immich's own ONNX exports, whose
+    embeddings agree with the mlx path to better than 0.999 cosine but are not
+    identical, which is the entire reason the position exists.
+    """
+    from ..config import settings
+
+    if getattr(settings, "stock_ml", False):
+        from .clip_stock import get_stock_clip_model
+
+        return get_stock_clip_model(model_name, settings.cache_dir)
+    return get_clip_model_mlx(model_name)
 from .face_detect import detect_faces as detect_faces_vision
 
 
