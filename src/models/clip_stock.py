@@ -116,7 +116,12 @@ class _StockCLIP:
         return _normalize(np.asarray(out[0], dtype=np.float32))
 
     def encode_text(self, text: str) -> np.ndarray:
+        # Truncate through the tokenizer, so the end-of-text token is kept at
+        # the end. A plain slice drops it, and the tower pools at the position
+        # that token marks, so the embedding would come from the wrong place.
+        self.tokenizer.enable_truncation(max_length=self.context_length)
         ids = self.tokenizer.encode(text).ids[: self.context_length]
+
         # CLIP's text tower takes a fixed-width context, zero padded. The index
         # dtype is read from the model rather than assumed: Immich's exports are
         # not consistent about int32 against int64, and onnxruntime rejects the
@@ -125,8 +130,20 @@ class _StockCLIP:
         dtype = np.int32 if "int32" in spec.type else np.int64
         padded = np.zeros((1, self.context_length), dtype=dtype)
         padded[0, : len(ids)] = ids
-        name = spec.name
-        out = self.textual.run(None, {name: padded})[0]
+
+        # Every input the model declares, not just the first. The multilingual
+        # towers also take attention_mask, and onnxruntime refuses the call
+        # outright rather than assuming ones.
+        feed = {spec.name: padded}
+        for extra in self.textual.get_inputs()[1:]:
+            if "mask" not in extra.name.lower():
+                continue
+            mask_dtype = np.int32 if "int32" in extra.type else np.int64
+            mask = np.zeros((1, self.context_length), dtype=mask_dtype)
+            mask[0, : len(ids)] = 1
+            feed[extra.name] = mask
+
+        out = self.textual.run(None, feed)[0]
         return _normalize(np.asarray(out[0], dtype=np.float32))
 
 

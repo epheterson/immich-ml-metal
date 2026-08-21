@@ -60,10 +60,13 @@ def recognize_text(image_bytes, min_confidence=0.5, use_language_correction=True
     if getattr(settings, "stock_ml", False):
         from .ocr_stock import recognize_text as recognize_text_stock
 
+        # The request's own threshold, as the Vision path gets. Passing the
+        # setting instead pins detection at 0.5 forever, since that setting is
+        # never read from the environment.
         return recognize_text_stock(
             image_bytes,
             settings.models_dir,
-            settings.ocr_min_detection_score,
+            min_confidence,
             min_confidence,
         )
     return recognize_text_vision(

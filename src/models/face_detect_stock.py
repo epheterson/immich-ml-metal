@@ -63,7 +63,7 @@ def _find_detection_model(model_dir: Path) -> Optional[Path]:
     return None
 
 
-def get_detector(model_name: str = "buffalo_l"):
+def get_detector(model_name: str = "buffalo_l", min_score: float = 0.5):
     """Build (once) the same RetinaFace detector Immich uses."""
     global _detector
     with _detector_lock:
@@ -88,7 +88,12 @@ def get_detector(model_name: str = "buffalo_l"):
         # ctx_id=-1 is CPU. onnxruntime has no Metal provider, and CoreML
         # rejects this graph's dynamic shapes, so CPU is what Docker uses here
         # too and what keeps the boxes identical.
-        detector.prepare(ctx_id=-1, input_size=_detector_input_size)
+        # det_thresh, or insightface pre-filters at its own 0.5 before our
+        # min_score is ever applied, and a lower configured threshold silently
+        # finds fewer faces than Docker would.
+        detector.prepare(
+            ctx_id=-1, det_thresh=min_score, input_size=_detector_input_size
+        )
         _detector = detector
         return _detector
 
@@ -118,11 +123,12 @@ def detect_faces(
 
     height, width = img_bgr.shape[:2]
 
-    try:
-        detector = get_detector(model_name)
-    except Exception as e:
-        logger.error("Stock face detector unavailable: %s", e)
-        return [], width, height
+    # Deliberately not caught. A detector that cannot load is not an image
+    # with no faces in it, and returning the latter marks every asset as
+    # processed with zero faces while /health, which calls this same seam,
+    # reports the detector as fine. The caller turns this into a 500, which is
+    # the honest answer and the one that gets looked at.
+    detector = get_detector(model_name, min_score)
 
     # insightface returns boxes already in pixels on the original image, plus a
     # score column. It applies its own NMS, matching Immich.

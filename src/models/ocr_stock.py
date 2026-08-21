@@ -49,6 +49,12 @@ class _OcrOptions(dict):
         self.font_path = None
 
 
+# 0.5 against 0-255 data, which is arithmetically not what PP-OCR's paper
+# describes and IS what Immich does (immich_ml/models/ocr/detection.py: mean
+# [0.5,0.5,0.5] subtracted from float32 0-255, times 1/(0.5*255)). Parity with
+# Immich is the entire point of this file, so it matches Immich rather than the
+# paper. Changing it to 127.5 was tried: the detector then reads nothing at all,
+# which the preflight OCR check catches.
 _MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 _STD_INV = np.float32(1.0) / (np.array([0.5, 0.5, 0.5], dtype=np.float32) * 255.0)
 
@@ -182,7 +188,7 @@ def _transform(img) -> np.ndarray:
     return np.expand_dims(arr, axis=0)
 
 
-def _sorted_boxes(boxes: np.ndarray) -> np.ndarray:
+def _sorted_box_order(boxes: np.ndarray) -> np.ndarray:
     """Immich's reading order: top to bottom, then left to right within a line.
 
     Lines are grouped by a 10-pixel jump in y, which is what makes two boxes
@@ -190,14 +196,14 @@ def _sorted_boxes(boxes: np.ndarray) -> np.ndarray:
     detector order.
     """
     if len(boxes) == 0:
-        return boxes
+        return np.empty(0, dtype=np.int64)
     y_order = np.argsort(boxes[:, 0, 1], kind="stable")
     sorted_y = boxes[y_order, 0, 1]
     line_ids = np.empty(len(boxes), dtype=np.int32)
     line_ids[0] = 0
     np.cumsum(np.abs(np.diff(sorted_y)) >= 10, out=line_ids[1:])
     sort_key = line_ids * 1e6 + boxes[y_order, 0, 0]
-    return boxes[y_order[np.argsort(sort_key, kind="stable")]]
+    return y_order[np.argsort(sort_key, kind="stable")]
 
 
 def recognize_text(
@@ -226,11 +232,12 @@ def recognize_text(
     if img.width < 32 or img.height < 32:
         return empty
 
-    try:
-        (session, postprocess), recognizer = _get_models(models_dir)
-    except Exception as e:
-        logger.error("Stock OCR models unavailable: %s", e)
-        return empty
+    # Deliberately not caught, exactly as in face_detect_stock. A missing
+    # rapidocr, a failed model download or an unreadable model file is not "this
+    # image contains no text": swallowing it marks every asset as processed with
+    # no text found and nothing anywhere says why. This surfaced as precisely
+    # that, an install with rapidocr absent quietly reading nothing at all.
+    (session, postprocess), recognizer = _get_models(models_dir)
 
     postprocess.box_thresh = min_detection_score
 
@@ -239,7 +246,14 @@ def recognize_text(
     if boxes is None or len(boxes) == 0:
         return empty
 
-    boxes = _sorted_boxes(np.asarray(boxes, dtype=np.float32))
+    # Reading order, carrying each box's score with it. Sorting the boxes and
+    # leaving the scores in detector order attaches every confidence to the
+    # wrong box the moment reading order differs from detection order.
+    boxes = np.asarray(boxes, dtype=np.float32)
+    box_scores = np.asarray(box_scores, dtype=np.float32)
+    order = _sorted_box_order(boxes)
+    boxes = boxes[order]
+    box_scores = box_scores[order]
 
     # Crop each detected quadrilateral and hand the crops to the recogniser in
     # one batch, which is what Immich does and what keeps the per-image cost
@@ -262,7 +276,9 @@ def recognize_text(
         if not text or score < min_recognition_score:
             continue
         kept_text.append(text)
-        kept_box.append([int(v) for v in np.asarray(boxes[i]).flatten().tolist()])
+        # Flat, not nested. OCRResult.box is list[float]; a list of lists fails
+        # response validation and every OCR request with text returns 500.
+        kept_box.extend(float(v) for v in np.asarray(boxes[i]).flatten().tolist())
         kept_box_score.append(float(box_scores[i]) if i < len(box_scores) else 0.0)
         kept_text_score.append(score)
 

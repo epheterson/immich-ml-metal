@@ -105,6 +105,17 @@ def _unload_model(model_type: str, reason: str) -> None:
     """Unload a specific model and log the reason."""
     try:
         if model_type == "clip":
+            # Stock keeps its own sessions, and they are the multi-gigabyte
+            # ones on a Stock install. Releasing only the mlx module here means
+            # the unloader reports freeing memory while freeing none of it.
+            if getattr(settings, "stock_ml", False):
+                from .models import clip_stock
+
+                clip_stock.unload_model()
+                logger.info("Unloaded stock CLIP model (%s)", reason)
+                _model_last_used.pop("clip", None)
+                return
+
             from .models import clip as clip_module
 
             with clip_module._model_lock:
@@ -115,6 +126,12 @@ def _unload_model(model_type: str, reason: str) -> None:
                     logger.info("Unloaded CLIP model (%s)", reason)
             _model_last_used.pop("clip", None)
         elif model_type == "face":
+            if getattr(settings, "stock_ml", False):
+                from .models import face_detect_stock
+
+                face_detect_stock.unload_detector()
+                logger.info("Unloaded stock face detector (%s)", reason)
+
             from .models import face_embed as face_module
 
             if face_module._recognition_model is not None:
