@@ -33,6 +33,12 @@ open-clip-torch>=2.24.0
 onnxruntime>=1.18.0
 insightface>=0.7.3
 
+# Immich's own OCR models, for the Stock position. Same package Immich depends
+# on, so the detector, the recogniser, the character dictionary and the model
+# downloads stay in step with what Docker produces rather than being
+# reimplemented here. Only imported when stock OCR is switched on.
+rapidocr>=3.1.0
+
 # Development/testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

@@ -322,7 +322,7 @@ def _run_face_recognition_sync(
     batched ONNX inference for all qualifying faces.
     """
     import cv2
-    from .models.face_detect import detect_faces
+    from .models import detect_faces
     from .models.face_embed import get_face_embeddings_batch
 
     _mark_model_busy("face")
@@ -408,17 +408,19 @@ async def health():
 
             # Actually test Vision framework with a minimal image
             try:
-                from .models.face_detect import detect_faces
+                from .models import detect_faces
 
                 # Create 1x1 test image
                 test_img = Image.new("RGB", (1, 1), color=(128, 128, 128))
                 buffer = io.BytesIO()
                 test_img.save(buffer, format="JPEG")
                 detect_faces(buffer.getvalue())
-                health_status["checks"]["vision_framework"] = "ok"
+                detector = "stock_detector" if settings.stock_faces else "vision_framework"
+                health_status["checks"][detector] = "ok"
             except Exception as e:
                 logger.error(f"Vision framework health check failed: {e}")
-                health_status["checks"]["vision_framework"] = f"error: {str(e)}"
+                detector = "stock_detector" if settings.stock_faces else "vision_framework"
+                health_status["checks"][detector] = f"error: {str(e)}"
                 health_status["status"] = "degraded"
         else:
             health_status["checks"]["stub_mode"] = "active"
@@ -638,7 +640,7 @@ async def _process_predict(
                 },
             )
         else:
-            from .models.ocr import recognize_text
+            from .models import recognize_text
 
             ocr_result = await _run_in_pool(
                 partial(

@@ -34,6 +34,17 @@ class Settings:
     # Lower values = more faces detected (more false positives)
     # Higher values = fewer faces detected (more false negatives)
     face_min_score: float = 0.7
+    # Run every model the way Docker does: Immich's ONNX detector and its
+    # RapidOCR models instead of Apple Vision. Slower, and the whole point, so
+    # a library stays portable back to a Docker install. One flag rather than
+    # one per subsystem, because Stock is a single claim about output and a
+    # per-feature flag would let that claim be half true.
+    stock_ml: bool = False
+    # Detect faces with Immich's own ONNX detector instead of Apple Vision.
+    # Slower, and the whole point: it is the same library, model and input size
+    # Docker uses, so boxes match rather than merely resemble. Set by the Stock
+    # position, where a library has to stay portable back to a Docker install.
+    stock_faces: bool = False
     
     # OCR settings
     ocr_min_detection_score: float = 0.5
@@ -74,6 +85,11 @@ class Settings:
             clip_model=os.getenv("ML_CLIP_MODEL", "ViT-B-32__openai"),
             face_model=os.getenv("ML_FACE_MODEL", "buffalo_l"),
             face_min_score=float(os.getenv("ML_FACE_MIN_SCORE", "0.7")),
+            stock_ml=os.getenv("ML_STOCK", "false").lower() == "true",
+            stock_faces=os.getenv(
+                "ML_STOCK_FACES", os.getenv("ML_STOCK", "false")
+            ).lower()
+            == "true",
             ocr_use_language_correction=os.getenv("ML_OCR_LANGUAGE_CORRECTION", "true").lower() == "true",
             use_coreml=os.getenv("ML_USE_COREML", "true").lower() == "true",
             use_ane=os.getenv("ML_USE_ANE", "true").lower() == "true",
