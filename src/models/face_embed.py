@@ -12,6 +12,7 @@ import io
 from typing import Optional
 from pathlib import Path
 import logging
+import shutil
 import threading
 import gc
 
@@ -196,6 +197,37 @@ def _load_model(model_name: str):
         raise RuntimeError(f"Could not load {model_name} recognition model") from e
 
 
+def _flatten_nested_pack(model_dir: Path, model_name: str) -> None:
+    """Move the pack's files up when insightface extracts them one level deep.
+
+    The behaviour is #8's; this is its failure paths.
+
+    Nothing here may raise. It runs inside the download's try block, so an
+    exception is reported as "could not download the model pack" for a pack
+    that downloaded perfectly well, which is a worse thing to debug than the
+    layout it is fixing. rmdir raises on a leftover .DS_Store, and
+    shutil.move raises when the destination already exists.
+
+    It also must not skip when some .onnx files are already at the top level.
+    An interrupted earlier run leaves exactly that, and skipping on it stranded
+    the remaining files one level down for good. Found by testing that case,
+    not by reading it.
+    """
+    nested = model_dir / model_name
+    if not nested.is_dir():
+        return  # nothing nested; a correct pack is never touched
+    logger.info(f"Flattening nested model pack at {nested}")
+    for item in nested.iterdir():
+        target = model_dir / item.name
+        if target.exists():
+            continue  # already moved by an earlier run
+        try:
+            shutil.move(str(item), str(target))
+        except OSError as e:
+            logger.warning(f"Could not move {item.name} out of {nested}: {e}")
+    shutil.rmtree(nested, ignore_errors=True)
+
+
 def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path:
     """
     Ensure the face model pack exists and contains a valid ArcFace model.
@@ -224,16 +256,7 @@ def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path
         download_model_pack(
             "models", model_name, force=force, root=str(insightface_root)
         )
-        
-        # Fix for insightface nested directory bug (e.g. models/antelopev2/antelopev2/)
-        import shutil
-        nested_dir = model_dir / model_name
-        if nested_dir.is_dir() and not list(model_dir.glob("*.onnx")):
-            logger.info(f"Fixing nested model directory: {nested_dir}")
-            for item in nested_dir.iterdir():
-                shutil.move(str(item), str(model_dir))
-            nested_dir.rmdir()
-            
+        _flatten_nested_pack(model_dir, model_name)
     except Exception as e:
         logger.error(f"Failed to download model pack: {e}", exc_info=True)
         raise RuntimeError(f"Could not download {model_name} model pack") from e
