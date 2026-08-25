@@ -12,6 +12,7 @@ import io
 from typing import Optional
 from pathlib import Path
 import logging
+import shutil
 import threading
 import gc
 
@@ -196,6 +197,42 @@ def _load_model(model_name: str):
         raise RuntimeError(f"Could not load {model_name} recognition model") from e
 
 
+def _flatten_nested_pack(model_dir: Path, model_name: str) -> None:
+    """Move the pack's files up when insightface extracts them one level deep.
+
+    Some packs unzip to models/<name>/<name>/*.onnx rather than
+    models/<name>/*.onnx. _find_recognition_model then sees an empty pack,
+    concludes the cache is invalid, deletes it and downloads it again, on every
+    single prediction request: a 350MB loop. antelopev2 does this; buffalo_l,
+    the default, does not, which is why it went unnoticed.
+
+    Nothing here may raise. It runs inside the download's try block, so an
+    exception would be reported as "could not download the model pack" for a
+    pack that downloaded perfectly well, which is a worse thing to debug than
+    the layout it is fixing.
+
+    Deliberately not skipped when some .onnx files are already at the top: an
+    interrupted earlier run leaves exactly that, and skipping on it left the
+    rest stranded one level down for good.
+    """
+    nested = model_dir / model_name
+    if not nested.is_dir():
+        return  # nothing nested; a correct pack is never touched
+    logger.info(f"Flattening nested model pack at {nested}")
+    for item in nested.iterdir():
+        target = model_dir / item.name
+        if target.exists():
+            continue  # already flattened by an earlier run; leave it alone
+        try:
+            shutil.move(str(item), str(target))
+        except OSError as e:
+            logger.warning(f"Could not move {item.name} out of {nested}: {e}")
+    # rmtree, not rmdir: a leftover .DS_Store would make rmdir raise, and the
+    # directory being gone is not what matters here, the .onnx files being
+    # findable is.
+    shutil.rmtree(nested, ignore_errors=True)
+
+
 def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path:
     """
     Ensure the face model pack exists and contains a valid ArcFace model.
@@ -224,6 +261,7 @@ def _ensure_recognition_model_pack(model_name: str, download_model_pack) -> Path
         download_model_pack(
             "models", model_name, force=force, root=str(insightface_root)
         )
+        _flatten_nested_pack(model_dir, model_name)
     except Exception as e:
         logger.error(f"Failed to download model pack: {e}", exc_info=True)
         raise RuntimeError(f"Could not download {model_name} model pack") from e
