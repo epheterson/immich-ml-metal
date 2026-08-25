@@ -368,13 +368,16 @@ class MLXClip:
         raise RuntimeError("CLIP encode_text_fallback failed to produce an embedding")
 
     def unload(self):
-        """Unload model and free memory."""
+        """Drop this instance from the global slot and hint the allocator to
+        reclaim memory. Does NOT clear self._model/_processor: a concurrent
+        request may still hold a reference to this exact instance (captured
+        via get_clip_model() before this switch) and be mid-inference against
+        it. Nulling those fields here corrupted that in-flight call instead of
+        the swap it was meant to represent — get_clip_model() already stopped
+        handing out this instance by the time unload() runs, so once every
+        holder finishes, normal refcounting frees it.
+        """
         logger.info(f"Unloading CLIP model: {self.model_name}")
-        self._model = None
-        self._processor = None
-        self._tokenizer = None
-        self._loaded = False
-
         gc.collect()
 
         try:
