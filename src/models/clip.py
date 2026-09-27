@@ -20,6 +20,57 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _resize_crop_like_immich(size: int):
+    """Immich's resize_pil then crop_pil, verbatim, int() truncation included.
+
+    Immich's ML container shapes every CLIP input this way, for every model,
+    and never reads the resize_mode a model's preprocessing config declares
+    (immich_ml/models/transforms.py). open_clip does read it, and for the
+    SigLIP and SigLIP2 webli weights it says "squash": stretch to a square.
+    Squashing a portrait photo embeds a different picture from the one the
+    container embedded for the same asset, so a library indexed by the
+    container and extended by this engine had two incompatible halves.
+    Measured on real portrait previews against the container: squash landed
+    as low as 0.82 cosine from the container's embedding of the same image.
+    """
+
+    def apply(img: Image.Image) -> Image.Image:
+        if img.width < img.height:
+            img = img.resize(
+                (size, int((img.height / img.width) * size)),
+                resample=Image.Resampling.BICUBIC,
+            )
+        else:
+            img = img.resize(
+                (int((img.width / img.height) * size), size),
+                resample=Image.Resampling.BICUBIC,
+            )
+        left = int((img.size[0] / 2) - (size / 2))
+        upper = int((img.size[1] / 2) - (size / 2))
+        return img.crop((left, upper, left + size, upper + size))
+
+    return apply
+
+
+def _preprocess_like_immich(preprocess):
+    """open_clip's pipeline with its geometry replaced by the container's.
+
+    Only the leading Resize/CenterCrop steps are swapped. Mode conversion,
+    tensor conversion and normalisation stay exactly as open_clip built them
+    from the model's own config, so mean and std still come from the weights.
+    """
+    from torchvision import transforms as T
+
+    steps = list(preprocess.transforms)
+    size = None
+    while steps and isinstance(steps[0], (T.Resize, T.CenterCrop)):
+        s = steps.pop(0).size
+        size = s if isinstance(s, int) else s[0]
+    if size is None:
+        return preprocess
+    return T.Compose([T.Lambda(_resize_crop_like_immich(size))] + steps)
+
+
 class _BatchAccumulator:
     """
     Dynamic micro-batcher for MPS fallback inference (SigLIP2 etc.).
@@ -329,6 +380,8 @@ class MLXClip:
                 arch, pretrained=pretrained
             )
             tokenizer = open_clip.get_tokenizer(arch)
+
+        preprocess = _preprocess_like_immich(preprocess)
 
         if torch.backends.mps.is_available():
             self._device = torch.device("mps")
