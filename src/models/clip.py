@@ -71,6 +71,64 @@ def _preprocess_like_immich(preprocess):
     return T.Compose([T.Lambda(_resize_crop_like_immich(size))] + steps)
 
 
+def _bytes_to_unicode() -> dict:
+    """CLIP's (GPT-2's) reversible byte -> printable character map.
+
+    BPE runs over these characters, never over raw text, so every possible
+    UTF-8 byte has a vocabulary entry.
+    """
+    keep = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    chars = keep[:]
+    n = 0
+    for b in range(256):
+        if b not in keep:
+            keep.append(b)
+            chars.append(256 + n)
+            n += 1
+    return dict(zip(keep, map(chr, chars)))
+
+
+class _ByteLevelTokenizer:
+    """mlx_clip's tokenizer, fixed to encode text the way Immich's does.
+
+    mlx_clip skips the byte-to-unicode step, so any character outside
+    printable Latin-1 (Cyrillic, CJK, emoji) was a KeyError and Smart Search
+    returned a 500 (#194). It also never truncated to the 77-token context,
+    so a long query overran the position embeddings. Same vocabulary, merges
+    and BPE as mlx_clip; the steps around them match the tokenizer.json
+    Immich's ML container loads: NFC, whitespace collapsed, lowercased,
+    byte-level, truncated with the end token kept.
+    """
+
+    CONTEXT_LENGTH = 77
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._byte_encoder = _bytes_to_unicode()
+
+    def encode(self, text: str) -> list:
+        import unicodedata
+
+        import regex
+
+        inner = self._inner
+        clean = regex.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip().lower()
+        ids = [inner.bos_token]
+        for piece in regex.findall(inner.pat, clean):
+            piece = "".join(self._byte_encoder[b] for b in piece.encode("utf-8"))
+            ids.extend(inner.vocab[t] for t in inner.bpe(piece))
+        return ids[: self.CONTEXT_LENGTH - 1] + [inner.eos_token]
+
+    def __call__(self, texts) -> mx.array:
+        if isinstance(texts, str):
+            texts = [texts]
+        return mx.array([self.encode(t) for t in texts])
+
+
 class _BatchAccumulator:
     """
     Dynamic micro-batcher for MPS fallback inference (SigLIP2 etc.).
@@ -282,6 +340,7 @@ class MLXClip:
 
             logger.info(f"Loading MLX CLIP model: {self.model_name} -> {self._repo_id}")
             self._model = mlx_clip(self._repo_id)
+            self._model.tokenizer = _ByteLevelTokenizer(self._model.tokenizer)
             self._loaded = True
             logger.info(f"Successfully loaded CLIP model via MLX: {self.model_name}")
 
