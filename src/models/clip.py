@@ -7,6 +7,8 @@ Thread-safe for both loading and inference.
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from src.mlx_thread import run_on_mlx_thread
 import numpy as np
 from PIL import Image
 from typing import Optional
@@ -309,7 +311,7 @@ class MLXClip:
         from src.gpu_lock import metal_lock
 
         self._inference_lock = metal_lock
-        self._load_model()
+        run_on_mlx_thread(self._load_model)
 
     def _load_model(self):
         """Load the MLX CLIP model, falling back to auto-conversion then open_clip."""
@@ -467,8 +469,9 @@ class MLXClip:
     def encode_image(self, image_bytes: bytes) -> np.ndarray:
         """
         Generate CLIP embedding for an image.
-        Thread-safe — only GPU inference is serialized. Image decode and
-        preprocessing run outside the lock. A reference to the model is
+        Thread-safe. Image decode runs on the caller's thread; MLX
+        preprocessing and inference run on the MLX thread (src/mlx_thread.py),
+        with inference under the metal lock. A reference to the model is
         captured before preprocessing and verified after acquiring the lock
         so a concurrent model switch cannot cause a mismatch. If the model
         was swapped mid-flight, preprocessing is re-run once against the
@@ -483,7 +486,10 @@ class MLXClip:
         if hasattr(self, "_use_fallback") and self._use_fallback:
             return self._encode_image_fallback(image)
 
-        # MLX path — preprocess the PIL image directly (no temp file needed).
+        return run_on_mlx_thread(self._encode_image_mlx, image)
+
+    def _encode_image_mlx(self, image: Image.Image) -> np.ndarray:
+        # MLX path, on the MLX thread — preprocess the PIL image directly.
         # Capture model reference before preprocessing so we can detect
         # if the model was swapped between preprocessing and inference.
         # One retry: if a concurrent request switched models between
@@ -540,6 +546,9 @@ class MLXClip:
         if hasattr(self, "_use_fallback") and self._use_fallback:
             return self._encode_text_fallback(text)
 
+        return run_on_mlx_thread(self._encode_text_mlx, text)
+
+    def _encode_text_mlx(self, text: str) -> np.ndarray:
         with self._inference_lock:
             embedding = self._model.text_encoder(text)
             if isinstance(embedding, mx.array):
@@ -602,13 +611,17 @@ class MLXClip:
 
         gc.collect()
 
+        run_on_mlx_thread(_clear_mlx_cache)
+
+
+def _clear_mlx_cache():
+    try:
+        mx.clear_cache()
+    except AttributeError:
         try:
-            mx.clear_cache()
-        except AttributeError:
-            try:
-                mx.metal.clear_cache()
-            except Exception:
-                pass
+            mx.metal.clear_cache()
+        except Exception:
+            pass
 
 
 # Global model cache with thread safety

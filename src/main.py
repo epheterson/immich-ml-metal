@@ -154,25 +154,11 @@ def _start_idle_monitor() -> None:
     logger.info("Model memory monitor started (strategy=%s)", MODEL_UNLOAD_STRATEGY)
 
 
-def _init_ml_thread():
-    """Initialize MLX GPU stream for this worker thread.
-    MLX streams are per-thread. Without this, the first MLX call in a
-    fresh pool thread crashes with 'There is no Stream(gpu, 0)'."""
-    if not STUB_MODE:
-        try:
-            import mlx.core as mx
-            _ = mx.array([0.0])
-            mx.eval(_)
-        except Exception:
-            pass  # Non-MLX paths (face/OCR threads) don't need this
-
-
 # Dedicated thread pool for ML inference — reuses threads instead of
 # creating a new one per asyncio.to_thread() call. 
 _inference_pool = ThreadPoolExecutor(
     max_workers=settings.max_concurrent_requests,
     thread_name_prefix="ml-inference",
-    initializer=_init_ml_thread,
 )
 
 
