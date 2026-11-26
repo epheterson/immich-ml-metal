@@ -15,11 +15,11 @@ pyobjc-framework-CoreML>=10.0
 
 # MLX for CLIP (Apple Silicon optimized)
 # Requires macOS >= 14.0, Python >= 3.10
-# Every release from 0.31.2 through 0.32.2 crashes CLIP inference in the worker thread pool
-# ("There is no Stream(gpu, 0)" / "Stream(cpu, 1)"; #38, #103). 0.31.1 is
-# the last known-good build. A re-test must reproduce the real /predict
-# service path (concurrent), not just mlx_clip.image_encoder, before lifting.
-mlx>=0.22.0,<0.31.2
+# From 0.31.2 on, MLX streams belong to the thread that made them, so every
+# MLX call runs on one thread (src/mlx_thread.py; #38, #103). Any new version
+# must pass the real /predict gate (scripts/ml-preflight.py in
+# immich-apple-silicon), not just mlx_clip.image_encoder.
+mlx==0.32.5
 huggingface-hub>=0.20.0
 
 # Pin mlx-clip to specific commit for stability
